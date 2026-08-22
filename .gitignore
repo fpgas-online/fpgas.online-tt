@@ -1,0 +1,12 @@
+.venv/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+# git worktrees for feature branches (superpowers:using-git-worktrees)
+.worktrees/
+# SDD workspace (superpowers:subagent-driven-development)
+.superpowers/
+# local scratch
+tmp/
