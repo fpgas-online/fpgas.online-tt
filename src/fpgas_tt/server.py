@@ -11,13 +11,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import socket
 import time
-import warnings
 
 from aiohttp import WSMsgType, web
-from aiohttp.web_exceptions import NotAppKeyWarning
 
 from fpgas_tt import __version__
 from fpgas_tt.bridge import BoardNotPresent, Bridge
@@ -31,16 +30,10 @@ CLOSE_CLIENT_SLOW = 1008
 
 def create_app(bridge: Bridge, config: BoardConfig, *, version: str = __version__) -> web.Application:
     app = web.Application()
-    # aiohttp recommends web.AppKey instances for app-storage keys, but our
-    # tests (and this module's own handlers) address app state by plain
-    # string for simplicity; silence the resulting NotAppKeyWarning rather
-    # than switch keys, since AppKey lookups aren't string-addressable.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", NotAppKeyWarning)
-        app["bridge"] = bridge
-        app["config"] = config
-        app["version"] = version
-        app["started"] = time.monotonic()
+    app["bridge"] = bridge
+    app["config"] = config
+    app["version"] = version
+    app["started"] = time.monotonic()
     app.add_routes([web.get("/health", health), web.get("/serial", serial_ws)])
     return app
 
@@ -73,15 +66,21 @@ async def serial_ws(request: web.Request) -> web.WebSocketResponse:
     await ws.send_json({"event": "board", "present": bridge.present, "device": bridge.device})
 
     async def pump_board_to_ws() -> None:
-        while True:
-            data = await client.read()
-            if data is None:
-                if client.dropped:
-                    await ws.close(code=CLOSE_CLIENT_SLOW, message=b"client too slow")
-                else:
-                    await ws.close(code=CLOSE_BOARD_LOST, message=b"board disconnected")
-                return
-            await ws.send_bytes(data)
+        try:
+            while True:
+                data = await client.read()
+                if data is None:
+                    if client.dropped:
+                        await ws.close(code=CLOSE_CLIENT_SLOW, message=b"client too slow")
+                    else:
+                        await ws.close(code=CLOSE_BOARD_LOST, message=b"board disconnected")
+                    return
+                await ws.send_bytes(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("serial: pump failed for %s", peer)
+            await ws.close(code=1011, message=b"internal error")
 
     pump = asyncio.create_task(pump_board_to_ws(), name="fpgas-tt-pump")
     try:
@@ -99,10 +98,8 @@ async def serial_ws(request: web.Request) -> web.WebSocketResponse:
     finally:
         client.close()
         pump.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await pump
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown path, already closing
-            pass
         log.info("serial: client %s disconnected (%d total)", peer, bridge.clients)
     return ws
 

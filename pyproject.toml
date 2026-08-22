@@ -32,3 +32,4 @@ packages = ["src/fpgas_tt"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = ["error", "ignore::aiohttp.web_exceptions.NotAppKeyWarning"]
