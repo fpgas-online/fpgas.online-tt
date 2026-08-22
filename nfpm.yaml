@@ -1,0 +1,28 @@
+name: fpgas-online-tt
+arch: all
+platform: linux
+version: "${VERSION}"
+maintainer: "fpgas.online <fpgas@fpgas.online>"
+description: "Tiny Tapeout demo-board serial bridge daemon for fpgas.online Pi nodes"
+homepage: https://github.com/fpgas-online/fpgas.online-tt
+license: Apache-2.0
+depends:
+  - python3 (>= 3.11)
+  - python3-aiohttp
+  - python3-serial-asyncio
+  - python3-yaml
+  - udev
+contents:
+  - src: src/fpgas_tt
+    dst: /usr/lib/python3/dist-packages/fpgas_tt
+  - src: bin/fpgas-tt
+    dst: /usr/bin/fpgas-tt
+    file_info:
+      mode: 0755
+  - src: debian/fpgas-tt.service
+    dst: /usr/lib/systemd/system/fpgas-tt.service
+  - src: debian/60-fpgas-tt.rules
+    dst: /etc/udev/rules.d/60-fpgas-tt.rules
+    type: config
+scripts:
+  postinstall: debian/postinstall.sh

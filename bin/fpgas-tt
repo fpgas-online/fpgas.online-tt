@@ -1,0 +1,3 @@
+#!/bin/sh
+# Thin launcher so the package needs no pip-installed console script.
+exec /usr/bin/python3 -m fpgas_tt "$@"
