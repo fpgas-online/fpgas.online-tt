@@ -26,6 +26,18 @@ def test_nfpm_version_comes_from_git_describe():
     assert version_cmd in build_deb_yml, "build-deb.yml must derive VERSION from deb-version.py"
 
 
+def test_build_deb_workflow_manages_series_release():
+    # The workflow must error if no vX.Y series tag exists (tags are
+    # human-pushed over SSH, not created by Actions). It must also upload
+    # assets to the release and not attempt tag creation.
+    build_deb_yml = (ROOT / ".github" / "workflows" / "build-deb.yml").read_text()
+    assert "gh release upload" in build_deb_yml, "workflow must upload assets to the series release"
+    assert '::error::no vX.Y series tag reachable from this commit' in build_deb_yml, \
+        "workflow must error if no series tag exists"
+    assert 'gh release create "$SERIES" --target' not in build_deb_yml, \
+        "workflow must not use --target with gh release create (cannot create tags via GITHUB_TOKEN)"
+
+
 def test_nfpm_depends_on_bookworm_packages_only():
     nfpm = yaml.safe_load((ROOT / "nfpm.yaml").read_text())
     assert set(nfpm["depends"]) == {
