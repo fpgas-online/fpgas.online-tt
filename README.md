@@ -56,15 +56,17 @@ Tests use a pseudo-terminal as a fake board; no hardware needed.
 This project is a **rolling release**. There are no manual version bumps:
 every green CI run on `main` builds `fpgas-online-tt_<version>_all.deb`
 (`nfpm.yaml`, `arch: all`) and uploads it as an asset on the current
-**series** GitHub Release — the release for the nearest `vX.Y` tag (e.g.
-`v0.1`). The repo's tag ruleset only admits two-component `vX.Y` tags, so
-that's what a series tag looks like; if no series tag exists yet, the first
-publish creates `v0.0` on the root commit and uses that. The
-[fpgas-online/apt](https://github.com/fpgas-online/apt) repo enumerates all
-of this repo's releases (every 15 min, or on demand) and pulls any new
+**series** GitHub Release.
+
+**Series tags** (`vX.Y`, e.g. `v0.1`) are two-component, enforced by the
+repo's tag ruleset, and must be pushed by a maintainer over SSH — the
+`GITHUB_TOKEN` cannot create tags via the Releases API. The first series
+`v0.0` sits on the root commit. The workflow only creates the release object
+(if it does not yet exist) and uploads assets to it; it does not create tags.
+The [fpgas-online/apt](https://github.com/fpgas-online/apt) repo enumerates
+all releases (every 15 min, or on demand) and pulls any new
 `fpgas-online-tt_*.deb` asset into its pool, publishing it to
-<https://fpgas-online.github.io/apt>. No tokens are involved on this side —
-the upload uses the workflow's own `GITHUB_TOKEN`.
+<https://fpgas-online.github.io/apt>. No tokens are involved on this side.
 
 - `.github/workflows/ci.yml` — lint/test/test-bookworm/deb gates on every
   push and PR. A green run on `main` is what triggers the release.
@@ -77,8 +79,8 @@ the upload uses the workflow's own `GITHUB_TOKEN`.
 The version is derived from `git describe` by `packaging/deb-version.py`: a
 `vX.Y` tag on `main` gives `X.Y`; each commit after it gives `X.Y.postN`;
 with no tag yet, `0.0.post<commit count>`. To start a new series, push an
-annotated `vX.Y` tag on `main` — that becomes both the version base and the
-release the deb is published to.
+annotated `vX.Y` tag on `main` over SSH — that becomes the version base; the
+workflow then uploads to the corresponding release.
 
 `pyproject.toml`'s static `version = "0.1.0"` is unrelated to the deb
 version above — it is only the wheel/series base and is not read by the

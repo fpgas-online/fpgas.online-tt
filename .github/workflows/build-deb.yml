@@ -71,21 +71,16 @@ jobs:
         run: |
           set -euo pipefail
           # The repo's tag ruleset only admits vX.Y-shaped tags, so the rolling release
-          # hangs off the CURRENT SERIES TAG (nearest v[0-9]* tag, e.g. v0.1). If no series
-          # tag exists yet, create v0.0 on the root commit (allowed by the ruleset; same
-          # convention as Tim's other repos) and use that. Every build appends its
-          # versioned asset; fpgas-online/apt enumerates all releases and pulls any
-          # fpgas-online-tt_*.deb asset it does not yet have.
+          # hangs off the CURRENT SERIES TAG (nearest v[0-9]* tag, e.g. v0.1). Series tags
+          # are always pushed by a human over SSH (two-component vX.Y only; e.g. v0.0 sits
+          # on the root commit). The GITHUB_TOKEN cannot create tags via the Releases API,
+          # so this step only creates the release object (if missing) and uploads assets.
           SERIES="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
           if [ -z "$SERIES" ]; then
-            SERIES=v0.0
-            ROOT="$(git rev-list --max-parents=0 HEAD | tail -1)"
-            if ! gh release view "$SERIES" >/dev/null 2>&1; then
-              gh release create "$SERIES" --target "$ROOT" --prerelease \
-                --title "Debian packages (rolling, series $SERIES)" \
-                --notes "Rolling .deb builds of fpgas-online-tt for series $SERIES: one asset per green commit on main (version from git describe). Consumed by https://github.com/fpgas-online/apt."
-            fi
-          elif ! gh release view "$SERIES" >/dev/null 2>&1; then
+            echo "::error::no vX.Y series tag reachable from this commit; push one over SSH (e.g. git tag -a v0.0 <root-commit> && git push origin v0.0) and re-run"
+            exit 1
+          fi
+          if ! gh release view "$SERIES" >/dev/null 2>&1; then
             gh release create "$SERIES" --prerelease \
               --title "Debian packages (rolling, series $SERIES)" \
               --notes "Rolling .deb builds of fpgas-online-tt for series $SERIES: one asset per green commit on main (version from git describe). Consumed by https://github.com/fpgas-online/apt."
