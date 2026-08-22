@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Derive the Debian package version from ``git describe``.
 
-At tag ``vX.Y.Z`` the version is ``X.Y.Z``; N commits later ``X.Y.Z.postN``.
-With no matching tag (the current upstream state) it falls back to
-``0.0.post<commit count>``. It increments on every commit, so each push
-publishes a new, upgradeable package with no manual bump and no tag. All
-forms are valid Debian versions verbatim, and match the ``hatch-vcs``
-post-release scheme used elsewhere in the fpgas.online rolling-release
-projects.
+Series tags are two-component, ``vX.Y`` (e.g. ``v0.1``; ``v0.0`` is the
+convention for the root commit) -- this matches the repo's tag ruleset,
+which only admits vX.Y-shaped tags. At tag ``vX.Y`` the version is ``X.Y``;
+N commits later ``X.Y.postN``. With no matching tag (the current upstream
+state) it falls back to ``0.0.post<commit count>``. It increments on every
+commit, so each push publishes a new, upgradeable package with no manual
+bump and no tag. All forms are valid Debian versions verbatim, and match
+the ``hatch-vcs`` post-release scheme used elsewhere in the fpgas.online
+rolling-release projects.
 
 Usage:
     python3 packaging/deb-version.py   # print the version

@@ -1262,6 +1262,10 @@ Merge when green; remove the worktree.
 
 ### Task 5: Debian packaging (nfpm), systemd unit, udev rule, release workflow
 
+> **Superseded:** the `APT_REPO_TOKEN` / `repository_dispatch` publish design below was
+> replaced by a token-less rolling GitHub Release — see README.md "Releases (rolling)".
+> Kept here for history.
+
 **Files:**
 - Create: `nfpm.yaml`, `bin/fpgas-tt`, `debian/fpgas-tt.service`, `debian/60-fpgas-tt.rules`, `debian/postinstall.sh`, `.github/workflows/build-deb.yml`, `tests/test_packaging.py`
 - Modify: `.github/workflows/ci.yml` (add a `deb` job that builds the package on PRs and uploads it as an artifact — no publish)
@@ -1522,6 +1526,11 @@ Merge when green (the `deb` job must be green too); remove the worktree.
 ---
 
 ### Task 6: Register the package in `fpgas-online/apt` and cut `v0.1.0`
+
+> **Superseded:** the `APT_REPO_TOKEN` / `repository_dispatch` registration flow below was
+> replaced by the apt repo enumerating GitHub Releases directly — see README.md "Releases
+> (rolling)". Also note: the tag ruleset only admits two-component `vX.Y` tags, so
+> `v0.1.0` below would not be creatable today; use `v0.1`. Kept here for history.
 
 **Files:**
 - Modify (in the `fpgas-online/apt` repo, in a worktree there): `tools/package_sources.toml`, `README.md` ("Hosted Packages" list)
