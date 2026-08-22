@@ -67,11 +67,17 @@ def discover(hostname: str, boards_path: str | Path) -> BoardConfig:
         for board in boards:
             if not board.get("enabled", True):
                 continue
-            if (int(board.get("switch", 1)), board.get("port")) != (switch, port):
+            raw_port = board.get("port")
+            if raw_port is None:  # a reserved/"coming soon" entry
+                continue
+            # YAML quoting must not change identity: `port: "6"` is port 6.
+            if (int(board.get("switch", 1)), int(raw_port)) != (switch, port):
                 continue
             kind = board.get("kind", "asic")
             if kind not in KINDS:
                 raise ValueError(f"{boards_path}: board {board.get('slug')!r} has unknown kind {kind!r}")
+            if "slug" not in board:
+                raise ValueError(f"{boards_path}: board on switch {switch} port {port} has no 'slug'")
             return BoardConfig(slug=str(board["slug"]), kind=kind, switch=switch, port=port, hostname=hostname)
 
     return BoardConfig(slug=hostname, kind="asic", switch=switch, port=port, hostname=hostname)
