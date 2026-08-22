@@ -143,10 +143,14 @@ class Bridge:
 
     async def write(self, data: bytes) -> None:
         writer = self._writer
-        if writer is None:
+        if writer is None or writer.is_closing():
             raise BoardNotPresent(self.device)
-        writer.write(data)
-        await writer.drain()
+        try:
+            writer.write(data)
+            await writer.drain()
+        except (OSError, serial.SerialException) as exc:
+            log.warning("bridge: write to %s failed: %s", self.device, exc)
+            raise BoardNotPresent(self.device) from exc
 
     # -- internals --
     async def _run(self) -> None:

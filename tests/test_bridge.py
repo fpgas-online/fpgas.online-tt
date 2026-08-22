@@ -87,6 +87,33 @@ async def test_unplug_closes_clients_and_replug_recovers(fake_board, bridge):
     client2.close()
 
 
+async def test_write_after_unplug_raises_board_not_present(fake_board, bridge):
+    client = bridge.subscribe()
+    fake_board.unplug()
+    await wait_for(lambda: not bridge.present)
+    with pytest.raises(BoardNotPresent):
+        await bridge.write(b"x")
+    with pytest.raises(BoardNotPresent):
+        await client.write(b"x")
+    client.close()
+
+
+async def test_write_during_closing_window_raises_board_not_present(fake_board, bridge):
+    # Between the transport detecting a port error and the read loop's
+    # `finally` clearing `present`, `self._writer` is still set but
+    # `writer.is_closing()` is already True. Reproducing that race against
+    # the real pty is non-deterministic (it depends on exact event-loop
+    # scheduling between the transport's read callback and our read loop's
+    # exception handling), so this drives the exact branch directly instead.
+    class ClosingWriter:
+        def is_closing(self):
+            return True
+
+    bridge._writer = ClosingWriter()
+    with pytest.raises(BoardNotPresent):
+        await bridge.write(b"x")
+
+
 async def test_start_without_device_keeps_retrying(tmp_path):
     b = Bridge(str(tmp_path / "missing"), reopen_interval=0.05)
     await b.start()
