@@ -1,7 +1,6 @@
 """Consistency checks between pyproject, nfpm.yaml and the unit/udev files."""
 
 import re
-import tomllib
 from pathlib import Path
 
 import yaml
@@ -9,30 +8,22 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_nfpm_version_tracks_pyproject():
-    # nfpm substitutes only plain ${VERSION} (no bash-style defaults).
-    # CI workflows derive VERSION from pyproject.toml or tags before calling nfpm.
-    # This test verifies: (a) nfpm.yaml uses ${VERSION}, (b) both workflows contain
-    # the sed expression to extract version from pyproject, and (c) the sed expression
-    # yields the actual project version.
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+def test_nfpm_version_comes_from_git_describe():
+    # nfpm substitutes only plain ${VERSION} (no bash-style defaults). Both
+    # workflows compute VERSION via packaging/deb-version.py (git-describe
+    # derived), not from pyproject.toml's static version -- the deb is a
+    # rolling release while pyproject.toml's version stays the wheel/series
+    # base (see README.md "Releases (rolling)").
     nfpm = yaml.safe_load((ROOT / "nfpm.yaml").read_text())
     assert nfpm["name"] == "fpgas-online-tt"
     assert nfpm["arch"] == "all"
     assert nfpm["version"] == "${VERSION}"
 
-    # Both workflow files must contain the sed expression for deriving version from pyproject.
-    sed_expr = "sed -n 's/^version = \"\\([^\"]*\\)\"/\\1/p' pyproject.toml"
+    version_cmd = "python3 packaging/deb-version.py"
     ci_yml = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
     build_deb_yml = (ROOT / ".github" / "workflows" / "build-deb.yml").read_text()
-    assert sed_expr in ci_yml, "ci.yml must contain sed expression"
-    assert sed_expr in build_deb_yml, "build-deb.yml must contain sed expression"
-
-    # Verify the sed expression actually yields the project version.
-    pyproject_text = (ROOT / "pyproject.toml").read_text()
-    match = re.search(r'^version = "([^"]*)"', pyproject_text, re.M)
-    assert match, "pyproject.toml must contain version field"
-    assert match.group(1) == pyproject["project"]["version"]
+    assert version_cmd in ci_yml, "ci.yml must derive VERSION from deb-version.py"
+    assert version_cmd in build_deb_yml, "build-deb.yml must derive VERSION from deb-version.py"
 
 
 def test_nfpm_depends_on_bookworm_packages_only():

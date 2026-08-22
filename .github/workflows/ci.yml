@@ -44,6 +44,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so deb-version.py can describe
       - name: Install nfpm
         env:
           GH_TOKEN: ${{ github.token }}
@@ -53,7 +55,7 @@ jobs:
           chmod +x nfpm
       - name: Build deb
         run: |
-          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml)"
+          VERSION="$(python3 packaging/deb-version.py)"
           export VERSION
           echo "VERSION=$VERSION"
           mkdir -p dist && ./nfpm package --packager deb --target dist/
