@@ -73,3 +73,30 @@ def test_discover_rejects_unknown_kind(tmp_path):
     p.write_text("tt_boards:\n  - {slug: x, port: 1, kind: banana}\n")
     with pytest.raises(ValueError, match="kind"):
         discover("pi-sw1-p1", p)
+
+
+def test_discover_matches_string_port(tmp_path):
+    """YAML quoting must not change which board a Pi thinks it is."""
+    p = tmp_path / "tt-boards.yaml"
+    p.write_text('tt_boards:\n  - {slug: tt06, switch: "1", port: "6"}\n')
+    assert discover("pi-sw1-p6", p).slug == "tt06"
+
+
+def test_discover_board_without_slug_raises(tmp_path):
+    p = tmp_path / "tt-boards.yaml"
+    p.write_text("tt_boards:\n  - {port: 6, kind: asic}\n")
+    with pytest.raises(ValueError, match="slug"):
+        discover("pi-sw1-p6", p)
+
+
+def test_discover_ignores_board_without_port(tmp_path):
+    p = tmp_path / "tt-boards.yaml"
+    p.write_text("tt_boards:\n  - {slug: coming-soon, port: null}\n")
+    assert discover("pi-sw1-p6", p).slug == "pi-sw1-p6"
+
+
+def test_load_boards_malformed_yaml_raises_value_error(tmp_path):
+    p = tmp_path / "bad.yaml"
+    p.write_text("tt_boards:\n  - {slug: [oops\n")
+    with pytest.raises(ValueError, match="not valid YAML"):
+        load_boards(p)

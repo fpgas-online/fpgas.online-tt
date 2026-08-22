@@ -32,4 +32,6 @@ packages = ["src/fpgas_tt"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-filterwarnings = ["error", "ignore::aiohttp.web_exceptions.NotAppKeyWarning"]
+# Message-based, not class-based: aiohttp 3.8.4 (bookworm) has no
+# NotAppKeyWarning class, and pytest errors out resolving it.
+filterwarnings = ["error", "ignore:It is recommended to use web.AppKey:UserWarning"]

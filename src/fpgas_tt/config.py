@@ -40,10 +40,15 @@ def load_boards(path: str | Path) -> list[dict]:
     """Return the ``tt_boards`` list from the YAML file at *path*.
 
     Raises ``FileNotFoundError`` if the file is missing and ``ValueError`` if
-    it is not a mapping with a ``tt_boards`` list.
+    it is unparseable or is not a mapping with a ``tt_boards`` list. Every
+    "this file is broken" failure is a ``ValueError`` so callers have exactly
+    one thing to fall back from.
     """
     with open(path, encoding="utf-8") as f:
-        doc = yaml.safe_load(f)
+        try:
+            doc = yaml.safe_load(f)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"{path}: not valid YAML: {exc}") from exc
     if not isinstance(doc, dict) or not isinstance(doc.get("tt_boards"), list):
         raise ValueError(f"{path}: expected a mapping with a 'tt_boards' list")
     return doc["tt_boards"]
@@ -67,11 +72,17 @@ def discover(hostname: str, boards_path: str | Path) -> BoardConfig:
         for board in boards:
             if not board.get("enabled", True):
                 continue
-            if (int(board.get("switch", 1)), board.get("port")) != (switch, port):
+            raw_port = board.get("port")
+            if raw_port is None:  # a reserved/"coming soon" entry
+                continue
+            # YAML quoting must not change identity: `port: "6"` is port 6.
+            if (int(board.get("switch", 1)), int(raw_port)) != (switch, port):
                 continue
             kind = board.get("kind", "asic")
             if kind not in KINDS:
                 raise ValueError(f"{boards_path}: board {board.get('slug')!r} has unknown kind {kind!r}")
+            if "slug" not in board:
+                raise ValueError(f"{boards_path}: board on switch {switch} port {port} has no 'slug'")
             return BoardConfig(slug=str(board["slug"]), kind=kind, switch=switch, port=port, hostname=hostname)
 
     return BoardConfig(slug=hostname, kind="asic", switch=switch, port=port, hostname=hostname)
