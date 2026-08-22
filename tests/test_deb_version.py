@@ -143,6 +143,38 @@ def test_commits_after_tag_get_post_suffix(tmp_path):
     assert result.stdout.strip() == f"0.1.0.post{n}"
 
 
+def test_two_component_series_tag_gives_bare_version(tmp_path):
+    """vX.Y (the repo's tag-ruleset-shaped series tag, e.g. v0.1) at HEAD -> X.Y."""
+    repo = tmp_path / "series-tag-repo"
+    _init_repo(repo)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.invalid", "-c", "user.name=Test User",
+         "-C", str(repo), "tag", "-a", "v0.1", "-m", "v0.1"],
+        check=True,
+    )
+
+    result = _run_in_repo(repo)
+    assert result.stdout.strip() == "0.1"
+
+
+def test_commits_after_two_component_series_tag_get_post_suffix(tmp_path):
+    """N commits after vX.Y -> X.Y.postN."""
+    repo = tmp_path / "series-tag-repo-2"
+    _init_repo(repo)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.invalid", "-c", "user.name=Test User",
+         "-C", str(repo), "tag", "-a", "v0.1", "-m", "v0.1"],
+        check=True,
+    )
+
+    n = 2
+    for i in range(n):
+        _commit(repo, f"commit {i} after tag")
+
+    result = _run_in_repo(repo)
+    assert result.stdout.strip() == f"0.1.post{n}"
+
+
 def test_debs_tag_does_not_affect_version(tmp_path):
     """The rolling-release GitHub Release uses a fixed tag named ``debs`` to
     hold one asset per build (see .github/workflows/build-deb.yml). That tag
