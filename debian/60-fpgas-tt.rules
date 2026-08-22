@@ -1,0 +1,4 @@
+# Tiny Tapeout demo board (RP2040 / RP2350 running the TT MicroPython SDK):
+# stable /dev/ttboard symlink for fpgas-tt, readable by the dialout group.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0005", SYMLINK+="ttboard", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000f", SYMLINK+="ttboard", GROUP="dialout", MODE="0660"
