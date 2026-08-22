@@ -51,10 +51,36 @@ uv run fpgas-tt --device /dev/ttyACM0 --boards tests/data/tt-boards.yaml --hostn
 
 Tests use a pseudo-terminal as a fake board; no hardware needed.
 
-## Packaging
+## Releases (rolling)
 
-`nfpm.yaml` builds an `arch: all` deb in CI (`.github/workflows/build-deb.yml`)
-on `v*` tags and publishes it to <https://fpgas-online.github.io/apt>.
+This project is a **rolling release**. There are no manual version bumps:
+every green CI run on `main` builds `fpgas-online-tt_<version>_all.deb`
+(`nfpm.yaml`, `arch: all`) and publishes it to
+<https://fpgas-online.github.io/apt> via `repository_dispatch` to
+`fpgas-online/apt`.
+
+- `.github/workflows/ci.yml` — lint/test/test-bookworm/deb gates on every
+  push and PR. A green run on `main` is what triggers the release.
+- `.github/workflows/build-deb.yml` — triggered by `workflow_run` when CI
+  completes successfully on `main` (checked out at the SHA CI validated,
+  with full history); builds the deb and, on success, dispatches
+  `receive-deb` to `fpgas-online/apt`. Also runs on `v*` tag pushes and
+  `workflow_dispatch`.
+
+The version is derived from `git describe` by `packaging/deb-version.py`: a
+`vX.Y.Z` tag on `main` gives `X.Y.Z`; each commit after it gives
+`X.Y.Z.postN`; with no tag yet, `0.0.post<commit count>`. To start a new
+series, push an annotated `vX.Y.Z` tag on `main`.
+
+`pyproject.toml`'s static `version = "0.1.0"` is unrelated to the deb
+version above — it is only the wheel/series base and is not read by the
+release workflow.
+
+The publish step needs the repository secret `APT_REPO_TOKEN`: a token
+allowed to send `repository_dispatch` events to `fpgas-online/apt`
+(Settings → Secrets and variables → Actions). Without it, the publish job
+fails visibly rather than being silently skipped. `workflow_dispatch`
+re-runs of `build-deb.yml` are allowed at any time.
 
 ## License
 
