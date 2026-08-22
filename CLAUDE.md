@@ -12,7 +12,7 @@ board plus a health endpoint. Design spec:
 - `src/fpgas_tt/bridge.py` — `Bridge` (one serial owner) and `Client`
 - `src/fpgas_tt/server.py` — aiohttp app (`/health`, `/serial`) and CLI `main()`
 - `tests/` — pytest; a pty stands in for the board
-- `nfpm.yaml`, `debian/`, `bin/` — deb packaging (arch all)
+- `nfpm.yaml`, `debian/`, `bin/`, `packaging/deb-version.py` — deb packaging (arch all); rolling release, version from `git describe`, published on every green CI run on `main` (see README.md "Releases (rolling)")
 
 Invariants: exactly one owner of the serial port; every consumer (WebSocket
 viewers and future tasks) is a bridge client; no arbitration; slow clients are
