@@ -1,15 +1,16 @@
 name: Build and publish deb
 
 # Rolling release: every GREEN push to main builds fpgas-online-tt and
-# publishes it to the fpgas-online/apt repository via repository_dispatch.
-# The package is Architecture: all (pure Python), so it builds on the
-# default runner and installs on any Debian arch. The version is
-# git-derived (vX.Y.Z at a tag, vX.Y.Z.postN after it).
+# publishes it as an asset on the rolling "debs" GitHub Release. No tokens
+# involved: the fpgas-online/apt repo polls that release and pulls in any
+# asset it does not yet have. The package is Architecture: all (pure
+# Python), so it builds on the default runner and installs on any Debian
+# arch. The version is git-derived (vX.Y.Z at a tag, vX.Y.Z.postN after it).
 #
 # Gated on CI: triggered when the "CI" workflow completes for main, and the
-# build/publish jobs only proceed when that run succeeded, so a red commit
-# never reaches the apt repo. push:tags stays for cutting a new series
-# directly, and workflow_dispatch for manual re-runs.
+# publish step only runs when that run succeeded, so a red commit never
+# reaches the release. push:tags stays for cutting a new series directly,
+# and workflow_dispatch for manual re-runs.
 on:
   workflow_run:
     workflows: [CI]
@@ -19,14 +20,15 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write # to create/update the "debs" GitHub Release with GITHUB_TOKEN
+
 jobs:
   build:
     # workflow_run fires on every completion (failure/cancelled too); only a
-    # successful CI run is a release. publish inherits the skip via needs.
+    # successful CI run is a release.
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,12 +46,10 @@ jobs:
           chmod +x nfpm
 
       - name: Build deb (arch all)
-        id: version
         run: |
           VERSION="$(python3 packaging/deb-version.py)"
           export VERSION
           echo "VERSION=$VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           mkdir -p dist
           ./nfpm package --packager deb --target dist/
           ls -l dist/
@@ -59,24 +59,20 @@ jobs:
           name: deb-package
           path: dist/*.deb
 
-  publish:
-    needs: build
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      # If APT_REPO_TOKEN is unset, repository-dispatch fails visibly here
-      # (rather than being silently gated away) -- see README.md "Releases
-      # (rolling)" for what the secret needs and how to create it.
-      - name: Trigger apt repo update
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.APT_REPO_TOKEN }}
-          repository: fpgas-online/apt
-          event-type: receive-deb
-          client-payload: |
-            {
-              "package_name": "fpgas-online-tt",
-              "package_version": "${{ needs.build.outputs.version }}",
-              "run_id": "${{ github.run_id }}",
-              "source_repo": "${{ github.repository }}"
-            }
+      - name: Publish deb to the rolling "debs" release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # One rolling pre-release, tag "debs" pinned to the root commit forever (never moved);
+          # every build appends its versioned asset. The fpgas-online/apt repo polls this
+          # release and pulls any asset it does not yet have into its pool.
+          ROOT="$(git rev-list --max-parents=0 HEAD | tail -1)"
+          if ! gh release view debs >/dev/null 2>&1; then
+            gh release create debs --target "$ROOT" --prerelease \
+              --title "Debian packages (rolling)" \
+              --notes "Rolling .deb builds of fpgas-online-tt, one asset per green commit on main (version from git describe). Consumed by https://github.com/fpgas-online/apt."
+          fi
+          gh release upload debs dist/*.deb --clobber
+          echo "Published: $(ls dist/*.deb)"

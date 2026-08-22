@@ -143,6 +143,37 @@ def test_commits_after_tag_get_post_suffix(tmp_path):
     assert result.stdout.strip() == f"0.1.0.post{n}"
 
 
+def test_debs_tag_does_not_affect_version(tmp_path):
+    """The rolling-release GitHub Release uses a fixed tag named ``debs`` to
+    hold one asset per build (see .github/workflows/build-deb.yml). That tag
+    must never be mistaken for a version tag: the script only matches
+    ``v[0-9]*``, so tagging the tip commit ``debs`` must leave the computed
+    version unchanged.
+    """
+    repo = tmp_path / "debs-tag-repo"
+    _init_repo(repo)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.invalid", "-c", "user.name=Test User",
+         "-C", str(repo), "tag", "-a", "v0.1.0", "-m", "v0.1.0"],
+        check=True,
+    )
+    n = 2
+    for i in range(n):
+        _commit(repo, f"commit {i} after tag")
+
+    before = _run_in_repo(repo).stdout.strip()
+    assert before == f"0.1.0.post{n}"
+
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.invalid", "-c", "user.name=Test User",
+         "-C", str(repo), "tag", "-a", "debs", "-m", "rolling release marker"],
+        check=True,
+    )
+
+    after = _run_in_repo(repo).stdout.strip()
+    assert after == before == f"0.1.0.post{n}"
+
+
 def test_shallow_clone_fails_loudly_instead_of_wrong_version(tmp_path):
     """A shallow clone must FAIL, not silently emit a truncated 0.0.post1.
 
