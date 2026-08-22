@@ -1,11 +1,17 @@
 name: Build and publish deb
 
 # Rolling release: every GREEN push to main builds fpgas-online-tt and
-# publishes it as an asset on the rolling "debs" GitHub Release. No tokens
-# involved: the fpgas-online/apt repo polls that release and pulls in any
-# asset it does not yet have. The package is Architecture: all (pure
-# Python), so it builds on the default runner and installs on any Debian
-# arch. The version is git-derived (vX.Y.Z at a tag, vX.Y.Z.postN after it).
+# publishes it as an asset on the current series' rolling GitHub Release
+# (the nearest vX.Y tag, e.g. v0.1; v0.0 is created on the root commit if no
+# series tag exists yet). No tokens involved: the fpgas-online/apt repo
+# enumerates all releases and pulls in any asset it does not yet have. The
+# package is Architecture: all (pure Python), so it builds on the default
+# runner and installs on any Debian arch. The version is git-derived (vX.Y
+# at a tag, vX.Y.postN after it).
+#
+# Two-component vX.Y tags only: the repo's tag ruleset ("Enforce vXX.ZZZ
+# version tags") only admits vX.Y-shaped tags, so a rolling release cannot
+# hang off a fixed tag name -- it hangs off the current series tag instead.
 #
 # Gated on CI: triggered when the "CI" workflow completes for main, and the
 # publish step only runs when that run succeeded, so a red commit never
@@ -21,7 +27,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # to create/update the "debs" GitHub Release with GITHUB_TOKEN
+  contents: write # to create/update the current series GitHub Release with GITHUB_TOKEN
 
 jobs:
   build:
@@ -59,20 +65,30 @@ jobs:
           name: deb-package
           path: dist/*.deb
 
-      - name: Publish deb to the rolling "debs" release
-        if: github.event_name != 'pull_request'
+      - name: Publish deb to the current series release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # One rolling pre-release, tag "debs" pinned to the root commit forever (never moved);
-          # every build appends its versioned asset. The fpgas-online/apt repo polls this
-          # release and pulls any asset it does not yet have into its pool.
-          ROOT="$(git rev-list --max-parents=0 HEAD | tail -1)"
-          if ! gh release view debs >/dev/null 2>&1; then
-            gh release create debs --target "$ROOT" --prerelease \
-              --title "Debian packages (rolling)" \
-              --notes "Rolling .deb builds of fpgas-online-tt, one asset per green commit on main (version from git describe). Consumed by https://github.com/fpgas-online/apt."
+          # The repo's tag ruleset only admits vX.Y-shaped tags, so the rolling release
+          # hangs off the CURRENT SERIES TAG (nearest v[0-9]* tag, e.g. v0.1). If no series
+          # tag exists yet, create v0.0 on the root commit (allowed by the ruleset; same
+          # convention as Tim's other repos) and use that. Every build appends its
+          # versioned asset; fpgas-online/apt enumerates all releases and pulls any
+          # fpgas-online-tt_*.deb asset it does not yet have.
+          SERIES="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+          if [ -z "$SERIES" ]; then
+            SERIES=v0.0
+            ROOT="$(git rev-list --max-parents=0 HEAD | tail -1)"
+            if ! gh release view "$SERIES" >/dev/null 2>&1; then
+              gh release create "$SERIES" --target "$ROOT" --prerelease \
+                --title "Debian packages (rolling, series $SERIES)" \
+                --notes "Rolling .deb builds of fpgas-online-tt for series $SERIES: one asset per green commit on main (version from git describe). Consumed by https://github.com/fpgas-online/apt."
+            fi
+          elif ! gh release view "$SERIES" >/dev/null 2>&1; then
+            gh release create "$SERIES" --prerelease \
+              --title "Debian packages (rolling, series $SERIES)" \
+              --notes "Rolling .deb builds of fpgas-online-tt for series $SERIES: one asset per green commit on main (version from git describe). Consumed by https://github.com/fpgas-online/apt."
           fi
-          gh release upload debs dist/*.deb --clobber
-          echo "Published: $(ls dist/*.deb)"
+          gh release upload "$SERIES" dist/*.deb --clobber
+          echo "Published to release $SERIES: $(ls dist/*.deb)"
