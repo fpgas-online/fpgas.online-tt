@@ -15,8 +15,8 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   and may write bytes to it. No locking. A client that falls more than 256 KiB
   behind is dropped; the board reader is never blocked.
 - `GET /health` — `{"board": {"present": bool, "device": str}, "kind": str,
-  "slug": str, "switch": int|null, "port": int|null, "clients": int,
-  "uptime_s": int, "version": str}`.
+  "slug": str, "switch": int|null, "port": int|null, "hostname": str,
+  "clients": int, "uptime_s": int, "version": str}`.
 - Discovers which board it is from its hostname (`pi-sw<switch>-p<port>`) and
   `/etc/fpgas-online/tt-boards.yaml` (baked into the Pi NFS root by
   fpgas.online-infra). Unknown hostname ⇒ plain `asic` bridge.
