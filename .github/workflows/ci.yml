@@ -35,6 +35,9 @@ jobs:
           chmod +x nfpm
       - name: Build deb
         run: |
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml)"
+          export VERSION
+          echo "VERSION=$VERSION"
           mkdir -p dist && ./nfpm package --packager deb --target dist/
           dpkg-deb --info dist/*.deb
           dpkg-deb --contents dist/*.deb

@@ -10,12 +10,29 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_nfpm_version_tracks_pyproject():
+    # nfpm substitutes only plain ${VERSION} (no bash-style defaults).
+    # CI workflows derive VERSION from pyproject.toml or tags before calling nfpm.
+    # This test verifies: (a) nfpm.yaml uses ${VERSION}, (b) both workflows contain
+    # the sed expression to extract version from pyproject, and (c) the sed expression
+    # yields the actual project version.
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
     nfpm = yaml.safe_load((ROOT / "nfpm.yaml").read_text())
     assert nfpm["name"] == "fpgas-online-tt"
     assert nfpm["arch"] == "all"
-    # nfpm takes VERSION from the environment in CI; the fallback must match pyproject.
-    assert nfpm["version"] == "${VERSION:-%s}" % pyproject["project"]["version"]
+    assert nfpm["version"] == "${VERSION}"
+
+    # Both workflow files must contain the sed expression for deriving version from pyproject.
+    sed_expr = "sed -n 's/^version = \"\\([^\"]*\\)\"/\\1/p' pyproject.toml"
+    ci_yml = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    build_deb_yml = (ROOT / ".github" / "workflows" / "build-deb.yml").read_text()
+    assert sed_expr in ci_yml, "ci.yml must contain sed expression"
+    assert sed_expr in build_deb_yml, "build-deb.yml must contain sed expression"
+
+    # Verify the sed expression actually yields the project version.
+    pyproject_text = (ROOT / "pyproject.toml").read_text()
+    match = re.search(r'^version = "([^"]*)"', pyproject_text, re.M)
+    assert match, "pyproject.toml must contain version field"
+    assert match.group(1) == pyproject["project"]["version"]
 
 
 def test_nfpm_depends_on_bookworm_packages_only():

@@ -1,7 +1,7 @@
 name: fpgas-online-tt
 arch: all
 platform: linux
-version: "${VERSION:-0.1.0}"
+version: "${VERSION}"
 maintainer: "fpgas.online <fpgas@fpgas.online>"
 description: "Tiny Tapeout demo-board serial bridge daemon for fpgas.online Pi nodes"
 homepage: https://github.com/fpgas-online/fpgas.online-tt

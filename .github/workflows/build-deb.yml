@@ -21,8 +21,9 @@ jobs:
 
       - name: Build deb (arch all)
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml)"; fi
           export VERSION
+          echo "VERSION=$VERSION"
           mkdir -p dist
           ./nfpm package --packager deb --target dist/
           ls -l dist/
