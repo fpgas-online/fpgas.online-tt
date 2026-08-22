@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import termios
 import tty
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +47,9 @@ class FakeBoard:
 
     def replug(self) -> None:
         """Create a fresh pty and repoint the symlink at it (a new /dev/ttyACM0)."""
+        if self.slave >= 0:
+            os.close(self.slave)  # the old pty's slave, or we leak an fd per replug
+            self.slave = -1
         master, slave = _open_raw_pty()
         self.master, self.slave = master, slave
         tmp = self._link_dir / "ttboard.new"
@@ -60,8 +62,6 @@ def _open_raw_pty() -> tuple[int, int]:
     tty.setraw(slave)
     tty.setraw(master)
     # Keep the slave open on our side too; pyserial opens its own fd by path.
-    attrs = termios.tcgetattr(slave)
-    termios.tcsetattr(slave, termios.TCSANOW, attrs)
     return master, slave
 
 

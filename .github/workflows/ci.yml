@@ -22,6 +22,24 @@ jobs:
       - run: uv sync
       - run: uv run pytest -v
 
+  # The Pi runtime is bookworm: python3.11 + the distro's aiohttp 3.8.4 /
+  # pyserial-asyncio 0.6. `uv sync` resolves much newer wheels, so pin the
+  # deployed versions here and run the same suite against them.
+  test-bookworm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: Install bookworm-pinned dependencies
+        run: |
+          uv venv --python 3.11 .venv-bookworm
+          uv pip install --python .venv-bookworm \
+            "aiohttp==3.8.4" "pyserial-asyncio==0.6" "PyYAML>=6,<7" \
+            "pytest>=8" "pytest-aiohttp>=1.0" "pytest-asyncio>=0.23" -e .
+      - run: .venv-bookworm/bin/python -m pytest -v
+
   deb:
     runs-on: ubuntu-latest
     steps:
