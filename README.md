@@ -14,9 +14,15 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
 - `WS /serial` — every connected client receives the same bytes from the board
   and may write bytes to it. No locking. A client that falls more than 256 KiB
   behind is dropped; the board reader is never blocked.
-- `GET /health` — `{"board": {"present": bool, "device": str}, "kind": str,
-  "slug": str, "switch": int|null, "port": int|null, "hostname": str,
-  "clients": int, "uptime_s": int, "version": str}`.
+- `GET /health` — `{"board": {"present": bool, "device": str,
+  "vid_pid": str|null}, "kind": str, "slug": str, "switch": int|null,
+  "port": int|null, "hostname": str, "clients": int, "uptime_s": int,
+  "version": str, "config_error": str|null}`. `vid_pid` is the board's USB
+  `idVendor:idProduct` read from sysfs (`null` if the device is not a USB
+  tty); `config_error` is non-null when the board map was unreadable and the
+  daemon fell back to a plain `asic` bridge instead of restart-looping.
+- On shutdown every open `/serial` socket is closed with code 1001
+  (`server shutdown`); on board loss with 1011 (`board disconnected`).
 - Discovers which board it is from its hostname (`pi-sw<switch>-p<port>`) and
   `/etc/fpgas-online/tt-boards.yaml` (baked into the Pi NFS root by
   fpgas.online-infra). Unknown hostname ⇒ plain `asic` bridge.

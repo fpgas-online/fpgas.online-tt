@@ -93,3 +93,10 @@ def test_discover_ignores_board_without_port(tmp_path):
     p = tmp_path / "tt-boards.yaml"
     p.write_text("tt_boards:\n  - {slug: coming-soon, port: null}\n")
     assert discover("pi-sw1-p6", p).slug == "pi-sw1-p6"
+
+
+def test_load_boards_malformed_yaml_raises_value_error(tmp_path):
+    p = tmp_path / "bad.yaml"
+    p.write_text("tt_boards:\n  - {slug: [oops\n")
+    with pytest.raises(ValueError, match="not valid YAML"):
+        load_boards(p)

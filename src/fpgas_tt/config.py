@@ -40,10 +40,15 @@ def load_boards(path: str | Path) -> list[dict]:
     """Return the ``tt_boards`` list from the YAML file at *path*.
 
     Raises ``FileNotFoundError`` if the file is missing and ``ValueError`` if
-    it is not a mapping with a ``tt_boards`` list.
+    it is unparseable or is not a mapping with a ``tt_boards`` list. Every
+    "this file is broken" failure is a ``ValueError`` so callers have exactly
+    one thing to fall back from.
     """
     with open(path, encoding="utf-8") as f:
-        doc = yaml.safe_load(f)
+        try:
+            doc = yaml.safe_load(f)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"{path}: not valid YAML: {exc}") from exc
     if not isinstance(doc, dict) or not isinstance(doc.get("tt_boards"), list):
         raise ValueError(f"{path}: expected a mapping with a 'tt_boards' list")
     return doc["tt_boards"]

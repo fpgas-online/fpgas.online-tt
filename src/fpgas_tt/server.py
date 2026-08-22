@@ -20,22 +20,48 @@ from aiohttp import WSMsgType, web
 
 from fpgas_tt import __version__
 from fpgas_tt.bridge import BoardNotPresent, Bridge
-from fpgas_tt.config import BoardConfig, discover
+from fpgas_tt.config import BoardConfig, discover, parse_hostname
+from fpgas_tt.usbinfo import vid_pid_for_tty
 
 log = logging.getLogger(__name__)
 
+CLOSE_GOING_AWAY = 1001
 CLOSE_BOARD_LOST = 1011
+CLOSE_INTERNAL_ERROR = 1011
 CLOSE_CLIENT_SLOW = 1008
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+# How long to wait for a peer's reply to a close frame we had to finish
+# ourselves; a vanished client must not hold up shutdown.
+CLOSE_REPLY_TIMEOUT = 2.0
+SHUTDOWN_TIMEOUT = 5.0
 
 
-def create_app(bridge: Bridge, config: BoardConfig, *, version: str = __version__) -> web.Application:
+def create_app(
+    bridge: Bridge,
+    config: BoardConfig,
+    *,
+    version: str = __version__,
+    config_error: str | None = None,
+) -> web.Application:
     app = web.Application()
     app["bridge"] = bridge
     app["config"] = config
     app["version"] = version
+    app["config_error"] = config_error
     app["started"] = time.monotonic()
+    app["websockets"] = set()
     app.add_routes([web.get("/health", health), web.get("/serial", serial_ws)])
+    app.on_shutdown.append(close_websockets)
     return app
+
+
+async def close_websockets(app: web.Application) -> None:
+    """Say goodbye on restart instead of dropping every socket on the floor."""
+    for ws in list(app["websockets"]):
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                ws.close(code=CLOSE_GOING_AWAY, message=b"server shutdown"), CLOSE_REPLY_TIMEOUT
+            )
 
 
 async def health(request: web.Request) -> web.Response:
@@ -43,7 +69,11 @@ async def health(request: web.Request) -> web.Response:
     config: BoardConfig = request.app["config"]
     return web.json_response(
         {
-            "board": {"present": bridge.present, "device": bridge.device},
+            "board": {
+                "present": bridge.present,
+                "device": bridge.device,
+                "vid_pid": vid_pid_for_tty(bridge.device),
+            },
             "kind": config.kind,
             "slug": config.slug,
             "switch": config.switch,
@@ -52,38 +82,50 @@ async def health(request: web.Request) -> web.Response:
             "clients": bridge.clients,
             "uptime_s": int(time.monotonic() - request.app["started"]),
             "version": request.app["version"],
+            "config_error": request.app["config_error"],
         }
     )
 
 
+# Reachable only from the gateway (per-port VLANs); no Origin check by design.
 async def serial_ws(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     bridge: Bridge = request.app["bridge"]
-    client = bridge.subscribe()
+    websockets: set = request.app["websockets"]
+    websockets.add(ws)
     peer = request.remote
-    log.info("serial: client %s connected (%d total)", peer, bridge.clients)
-    await ws.send_json({"event": "board", "present": bridge.present, "device": bridge.device})
+    client = None
+    pump = None
+    goodbye: tuple[int, bytes] | None = None
 
     async def pump_board_to_ws() -> None:
+        nonlocal goodbye
         try:
             while True:
                 data = await client.read()
                 if data is None:
                     if client.dropped:
-                        await ws.close(code=CLOSE_CLIENT_SLOW, message=b"client too slow")
+                        goodbye = (CLOSE_CLIENT_SLOW, b"client too slow")
                     else:
-                        await ws.close(code=CLOSE_BOARD_LOST, message=b"board disconnected")
+                        goodbye = (CLOSE_BOARD_LOST, b"board disconnected")
+                    await ws.close(code=goodbye[0], message=goodbye[1])
                     return
                 await ws.send_bytes(data)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("serial: pump failed for %s", peer)
-            await ws.close(code=1011, message=b"internal error")
+            goodbye = (CLOSE_INTERNAL_ERROR, b"internal error")
+            await ws.close(code=goodbye[0], message=goodbye[1])
 
-    pump = asyncio.create_task(pump_board_to_ws(), name="fpgas-tt-pump")
     try:
+        # Subscribe inside the try: anything that fails from here on must
+        # still unsubscribe, or the Client outlives its socket forever.
+        client = bridge.subscribe()
+        log.info("serial: client %s connected (%d total)", peer, bridge.clients)
+        await ws.send_json({"event": "board", "present": bridge.present, "device": bridge.device})
+        pump = asyncio.create_task(pump_board_to_ws(), name="fpgas-tt-pump")
         async for msg in ws:
             if msg.type == WSMsgType.BINARY:
                 payload = msg.data
@@ -96,10 +138,21 @@ async def serial_ws(request: web.Request) -> web.WebSocketResponse:
             except BoardNotPresent:
                 await ws.send_json({"event": "error", "error": "board not present"})
     finally:
-        client.close()
-        pump.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await pump
+        if pump is not None:
+            pump.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pump
+            # ws.close() called from the pump task parks until this receive
+            # loop yields, so the cancel above can land before the close frame
+            # is written. Finish the close the pump asked for.
+            if goodbye is not None and not ws.closed:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        ws.close(code=goodbye[0], message=goodbye[1]), CLOSE_REPLY_TIMEOUT
+                    )
+        if client is not None:
+            client.close()
+        websockets.discard(ws)
         log.info("serial: client %s disconnected (%d total)", peer, bridge.clients)
     return ws
 
@@ -116,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--baudrate", type=int, default=115200)
-    p.add_argument("--log-level", default="INFO")
+    p.add_argument("--log-level", default="INFO", choices=list(LOG_LEVELS))
     return p
 
 
@@ -124,12 +177,23 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    config = discover(args.hostname, args.boards)
+    config_error: str | None = None
+    try:
+        config = discover(args.hostname, args.boards)
+    except ValueError as exc:
+        # A broken board map must not put the unit in a Restart=always loop:
+        # serve the port as a plain asic bridge and report why in /health.
+        log.error("fpgas-tt: invalid boards file %s: %s — falling back to plain asic bridge", args.boards, exc)
+        config_error = str(exc) or None
+        sp = parse_hostname(args.hostname)
+        switch, port = sp if sp else (None, None)
+        config = BoardConfig(slug=args.hostname, kind="asic", switch=switch, port=port, hostname=args.hostname)
+
     log.info("fpgas-tt %s: %s kind=%s slug=%s device=%s", __version__, config.hostname, config.kind, config.slug,
              args.device)
 
     bridge = Bridge(args.device, baudrate=args.baudrate)
-    app = create_app(bridge, config)
+    app = create_app(bridge, config, config_error=config_error)
 
     async def on_startup(_app: web.Application) -> None:
         await bridge.start()
@@ -139,5 +203,12 @@ def main(argv: list[str] | None = None) -> int:
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
-    web.run_app(app, host=args.host, port=args.port, print=None)
+    web.run_app(
+        app,
+        host=args.host,
+        port=args.port,
+        print=None,
+        access_log=None,
+        shutdown_timeout=SHUTDOWN_TIMEOUT,
+    )
     return 0
