@@ -69,13 +69,13 @@ class ReplRunner:
             finally:
                 try:
                     await client.write(CTRL_B)
-                    # Give the transport a moment to actually flush the bytes
-                    # before we close the client out from under it -- there is
-                    # no reply to wait for, so nothing else forces this.
-                    await asyncio.sleep(0.05)
                 except BoardNotPresent:
                     log.warning("repl: board went away before the session could be closed")
-                client.close()
+                finally:
+                    # However CTRL_B above went -- delivered, BoardNotPresent, or some
+                    # other exception (e.g. an outer wait_for's CancelledError) -- this
+                    # client must never leak: unsubscribe it from the bridge no matter what.
+                    client.close()
 
 
 class _Session:
