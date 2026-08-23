@@ -57,7 +57,12 @@ def test_nfpm_ships_package_unit_rule_and_wrapper():
     assert "/usr/bin/fpgas-tt" in dsts
     assert "/usr/lib/systemd/system/fpgas-tt.service" in dsts
     assert "/etc/udev/rules.d/60-fpgas-tt.rules" in dsts
+    # the demos directory (--demos-dir default) is shipped empty; the demos deb fills it
+    assert "/usr/share/fpgas-tt/demos" in dsts
     for c in nfpm["contents"]:
+        if c.get("type") == "dir":
+            assert "src" not in c, c
+            continue
         assert (ROOT / c["src"]).exists(), c["src"]
 
 
