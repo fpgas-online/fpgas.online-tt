@@ -35,7 +35,7 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   | `GET /designs` | `{"enabled": str\|null, "designs": [{"name", "title", "author", "description", "docs_url", "repo_url", "clock_hz", "pinout", "source": "demo"\|"upload"}, ...]}` — every `.bin` under `/bitstreams`, demo metadata merged in from `index.json` when it matches a name |
   | `POST /designs/{name}/enable` | body `{"clock_hz": int}` (optional) → `{"enabled": name, "clock_hz": int\|null}` |
   | `POST /bitstream` | multipart form (`name`, `file`) → `201 {"name", "size", "evicted": [str, ...]}`; rejects names that collide with a demo, non-`[a-z0-9_]{1,40}` names, oversize (>256 KiB) or non-iCE40 files (400); evicts the oldest non-demo uploads first so at most 16 uploads remain |
-  | `POST /demos/sync` | (re)writes any demo whose on-disk size differs from what's on the board → `{"synced": [str, ...], "skipped": [str, ...]}` |
+  | `POST /demos/sync` | (re)writes any demo whose on-disk size differs from what's on the board → `{"synced": [str, ...], "skipped": [str, ...]}`; waits up to ~1 s for a running task before answering 409 |
 
   Non-fpga boards get `404 {"error": "not an fpga board", "detail": ""}` on
   all four. Other error shapes (`{"error": str, "detail": str}`): `503 board

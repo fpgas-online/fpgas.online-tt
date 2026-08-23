@@ -9,7 +9,8 @@ Endpoints:
   GET  /designs                 (fpga only) list bitstreams + which is enabled
   POST /designs/{name}/enable   (fpga only) load a bitstream, optional clock_hz
   POST /bitstream               (fpga only) upload a bitstream (multipart: name, file)
-  POST /demos/sync              (fpga only) (re)sync the on-disk demo set onto the board
+  POST /demos/sync              (fpga only) (re)sync the on-disk demo set onto the board;
+                                 waits up to ~1 s for a running task before answering 409
 
 The four design/bitstream/demo routes return 404
 ``{"error": "not an fpga board", "detail": ""}`` on non-fpga boards, and map
@@ -53,8 +54,8 @@ CLOSE_REPLY_TIMEOUT = 2.0
 SHUTDOWN_TIMEOUT = 5.0
 DEMO_SYNC_RETRY = 30.0
 # POST /demos/sync riding out a startup auto-sync still in flight: bounded
-# retries * delay = ~2s worst case before it finally surfaces 409.
-DEMOS_SYNC_BUSY_RETRIES = 20
+# retries * delay = ~1s worst case before it finally surfaces 409.
+DEMOS_SYNC_BUSY_RETRIES = 10
 DEMOS_SYNC_BUSY_RETRY_DELAY = 0.1
 
 
@@ -66,7 +67,9 @@ def create_app(
     config_error: str | None = None,
     demos_dir: Path | str = DEMOS_DIR_DEFAULT,
 ) -> web.Application:
-    app = web.Application()
+    # A little over the bitstream cap so multipart framing overhead never
+    # trips this before designs.validate_bitstream gets to give a proper 400.
+    app = web.Application(client_max_size=designs.MAX_BITSTREAM_BYTES + 64 * 1024)
     app["bridge"] = bridge
     app["config"] = config
     app["version"] = version
@@ -193,19 +196,19 @@ async def demos_sync(request: web.Request) -> web.Response:
         return err
 
     async def go():
-        return web.json_response(await _sync_demos_retrying_busy(request))
+        out = await _sync_demos_retrying_busy(request.app["repl"], request.app["demos_dir"])
+        return web.json_response(out)
 
     return await _run(request, go())
 
 
-async def _sync_demos_retrying_busy(request: web.Request) -> dict:
+async def _sync_demos_retrying_busy(repl: ReplRunner, demos_dir: Path) -> dict:
     """Sync is idempotent and often called right as the daemon boots, when
     the startup auto-sync (``start_demo_sync``) may still be finishing its
     own run. Rather than bounce that overlap straight to a 409 a caller has
     to retry themselves, ride out a short, bounded window of ``ReplBusy``
     before giving up -- the final attempt still surfaces 409 through `_run`
     exactly as any other genuinely-busy REPL task does."""
-    repl, demos_dir = request.app["repl"], request.app["demos_dir"]
     for _ in range(DEMOS_SYNC_BUSY_RETRIES - 1):
         try:
             return await designs.sync_demos(repl, demos_dir)
@@ -225,6 +228,13 @@ async def start_demo_sync(app: web.Application) -> None:
                     return
                 except ReplError as exc:
                     log.warning("demos: sync failed (%s); retrying in %ss", exc, DEMO_SYNC_RETRY)
+                    await asyncio.sleep(DEMO_SYNC_RETRY)
+                    continue
+                except Exception:
+                    # Must never die silently: an unexpected bug here would
+                    # otherwise leave the board without demos forever, with
+                    # nothing in the logs pointing at why.
+                    log.exception("demos: sync task raised an unexpected exception; retrying in %ss", DEMO_SYNC_RETRY)
                     await asyncio.sleep(DEMO_SYNC_RETRY)
                     continue
             await asyncio.sleep(0.2)

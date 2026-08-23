@@ -14,7 +14,7 @@ import logging
 import re
 from pathlib import Path
 
-from fpgas_tt.repl import ReplError, ReplRunner
+from fpgas_tt.repl import ReplError, ReplNoBoard, ReplRunner
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +93,32 @@ STAT_CODE = (
 
 REFRESH_CODE = "tt.shuttle._design_index = None\n"
 
+CLEAN_TMP_CODE = (
+    "import os\n"
+    "for f in os.listdir('/bitstreams'):\n"
+    "    if f.endswith('.tmp'):\n"
+    "        try:\n"
+    "            os.remove('/bitstreams/' + f)\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "print('ok')\n"
+)
+
+
+def _remove_code(*names: str) -> str:
+    """Best-effort ``os.remove`` for one or more board paths under /bitstreams."""
+    return (
+        "import os\n"
+        + "".join(
+            "try:\n"
+            f"    os.remove('/bitstreams/{n}')\n"
+            "except OSError:\n"
+            "    pass\n"
+            for n in names
+        )
+        + "print('ok')\n"
+    )
+
 
 def _enable_code(name: str, clock_hz: int | None) -> str:
     code = f"tt.shuttle.get({name!r}).enable()\n"
@@ -142,7 +168,20 @@ def _write_steps(name: str, data: bytes) -> list[str]:
 
 
 async def write_bitstream(runner: ReplRunner, name: str, data: bytes) -> None:
-    outs = await runner.exec_steps(_write_steps(name, data), timeout=60.0)
+    tmp = f"{name}.bin.tmp"
+    try:
+        outs = await runner.exec_steps(_write_steps(name, data), timeout=60.0)
+    except ReplNoBoard:
+        raise  # nothing we can do -- there's no board to run cleanup on
+    except ReplError:
+        # A failed write must not leave a straggling .tmp behind for later
+        # attempts to trip over. Best-effort only: this must never mask (or
+        # replace) the original failure.
+        try:
+            await runner.exec(_remove_code(tmp))
+        except Exception:  # deliberately broad: cleanup is best-effort, must never raise
+            log.warning("write_bitstream: best-effort cleanup of %s failed", tmp)
+        raise
     size = int(outs[-1].strip() or -1)
     if size != len(data):
         raise ReplError(f"board reports {size} bytes after writing {len(data)}", "")
@@ -170,6 +209,10 @@ async def sync_demos(runner: ReplRunner, demos_dir: Path) -> dict:
         # Nothing to do: skip the board round trip entirely so an empty (or
         # absent) demos dir never contends the one-task-at-a-time REPL lock.
         return {"synced": [], "skipped": []}
+    # Sweep any *.tmp left behind by a write that crashed or dropped
+    # mid-transfer before we last got here (write_bitstream's own cleanup is
+    # best-effort and can itself fail to run, e.g. if the board vanished).
+    await runner.exec(CLEAN_TMP_CODE)
     stats = json.loads(await runner.exec(STAT_CODE))
     synced, skipped = [], []
     for name in sorted(demos):

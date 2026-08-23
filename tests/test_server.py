@@ -5,11 +5,12 @@ from pathlib import Path
 import aiohttp
 import pytest
 
-from fpgas_tt import __version__
+from fpgas_tt import __version__, designs
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.config import BoardConfig
 from fpgas_tt.designs import ICE40_PREAMBLE
-from fpgas_tt.server import build_parser, create_app, main
+from fpgas_tt.repl import ReplBusy, ReplRunner
+from fpgas_tt.server import DEMOS_SYNC_BUSY_RETRY_DELAY, _sync_demos_retrying_busy, build_parser, create_app, main
 
 CFG = BoardConfig(slug="tt06", kind="asic", switch=1, port=6, hostname="pi-sw1-p6")
 
@@ -267,3 +268,63 @@ async def test_board_absent_gives_503(aiohttp_client, tmp_path):
 
 def test_parser_demos_dir_default():
     assert build_parser().parse_args([]).demos_dir == "/usr/share/fpgas-tt/demos"
+
+
+async def test_sync_demos_retrying_busy_succeeds_once_lock_frees(bridge, fake_repl):
+    # Simulate a concurrent task -- e.g. the startup auto-sync -- that holds
+    # the ReplRunner lock for a while, then releases it well inside the
+    # retry window. _sync_demos_retrying_busy must ride that out and succeed
+    # instead of surfacing the transient ReplBusy.
+    runner = ReplRunner(bridge)
+
+    async def hold_briefly():
+        async with runner._lock:
+            await asyncio.sleep(DEMOS_SYNC_BUSY_RETRY_DELAY * 3)
+
+    holder = asyncio.create_task(hold_briefly())
+    await wait_for(lambda: runner.busy)
+    out = await _sync_demos_retrying_busy(runner, DEMOS)
+    assert out == {"synced": ["tt_um_demo_a", "tt_um_demo_b"], "skipped": []}
+    await holder
+
+
+async def test_sync_demos_retrying_busy_gives_up_after_window(bridge, fake_repl):
+    # If the lock is still held well past the retry window, the final
+    # attempt's ReplBusy must propagate (for `_run` to turn into a 409),
+    # not hang or retry forever.
+    runner = ReplRunner(bridge)
+
+    async def hold_too_long():
+        async with runner._lock:
+            await asyncio.sleep(5)
+
+    holder = asyncio.create_task(hold_too_long())
+    await wait_for(lambda: runner.busy)
+    with pytest.raises(ReplBusy):
+        await _sync_demos_retrying_busy(runner, DEMOS)
+    holder.cancel()
+    try:
+        await holder
+    except asyncio.CancelledError:
+        pass
+
+
+async def test_auto_sync_task_survives_unexpected_exception_and_retries(
+    aiohttp_client, bridge, fake_repl, monkeypatch, caplog
+):
+    calls = {"n": 0}
+    real_sync_demos = designs.sync_demos
+
+    async def flaky(runner, demos_dir):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        return await real_sync_demos(runner, demos_dir)
+
+    monkeypatch.setattr(designs, "sync_demos", flaky)
+    monkeypatch.setattr("fpgas_tt.server.DEMO_SYNC_RETRY", 0.05)
+    with caplog.at_level("ERROR", logger="fpgas_tt.server"):
+        await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=DEMOS))
+        await wait_for(lambda: calls["n"] >= 2, timeout=5)
+    assert "unexpected exception" in caplog.text
+    assert "boom" in caplog.text

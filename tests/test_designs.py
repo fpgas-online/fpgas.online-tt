@@ -6,7 +6,7 @@ import pytest
 from fpgas_tt import designs
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.designs import ValidationError, validate_bitstream
-from fpgas_tt.repl import ReplRunner
+from fpgas_tt.repl import ReplError, ReplRunner
 
 DEMOS = Path(__file__).parent / "data" / "demos"
 PRE = b"\x7e\xaa\x99\x7e"
@@ -126,3 +126,52 @@ async def test_sync_demos_copies_missing_and_skips_same_size(runner, fake_repl):
     out = await designs.sync_demos(runner, DEMOS)
     assert out == {"synced": ["tt_um_demo_a"], "skipped": ["tt_um_demo_b"]}
     assert board_file(fake_repl, "tt_um_demo_a").read_bytes() == (DEMOS / "tt_um_demo_a.bin").read_bytes()
+
+
+async def test_sync_demos_with_empty_index_touches_nothing(runner, fake_repl, tmp_path):
+    # No index.json at all -- load_demo_index returns {} -- must skip the
+    # board round trip entirely: not one byte should cross the wire.
+    out = await designs.sync_demos(runner, tmp_path / "no-such-demos-dir")
+    assert out == {"synced": [], "skipped": []}
+    assert fake_repl.transcript == b""
+
+
+async def test_sync_demos_removes_stale_tmp_files(runner, fake_repl):
+    # A prior crash mid-write can leave a straggling *.tmp; sync_demos must
+    # sweep it before anything else, even though it's not a demo itself.
+    stale = fake_repl.root / "bitstreams" / "x.bin.tmp"
+    stale.write_bytes(b"partial")
+    board_file(fake_repl, "tt_um_demo_a").write_bytes((DEMOS / "tt_um_demo_a.bin").read_bytes())
+    board_file(fake_repl, "tt_um_demo_b").write_bytes((DEMOS / "tt_um_demo_b.bin").read_bytes())
+    out = await designs.sync_demos(runner, DEMOS)
+    assert out == {"synced": [], "skipped": ["tt_um_demo_a", "tt_um_demo_b"]}
+    assert not stale.exists()
+
+
+async def test_write_bitstream_cleans_up_tmp_on_failure(runner, fake_repl, monkeypatch):
+    # Simulate a write that gets partway (the temp file really is created on
+    # the board) and then fails -- e.g. the board raised mid-transfer, or
+    # someone else's keystrokes interfered. write_bitstream must not leave
+    # the .tmp behind for a later sync/upload to trip over.
+    real_exec_steps = ReplRunner.exec_steps
+
+    async def flaky_exec_steps(self, steps, **kw):
+        if len(steps) > 1:
+            await real_exec_steps(self, steps[:1], **kw)  # really create the .tmp
+            raise ReplError("simulated failure mid-write", "boom")
+        return await real_exec_steps(self, steps, **kw)  # cleanup's own single-step exec
+
+    monkeypatch.setattr(ReplRunner, "exec_steps", flaky_exec_steps)
+    data = PRE + bytes(range(256)) * 3
+    with pytest.raises(ReplError, match="simulated failure"):
+        await designs.write_bitstream(runner, "my_upload", data)
+    # The aborted session never ran the board-side `f.close()` -- unlike a
+    # real board's file object, the host-side fake's leaks an open fd that
+    # would otherwise trip a ResourceWarning at interpreter shutdown; the
+    # cleanup snippet already unlinked the path itself (see the assertions
+    # below), so this is just tidying up the fake's own simulated state.
+    leaked = fake_repl._globals.pop("f", None)
+    if leaked is not None:
+        leaked.close()
+    assert not (fake_repl.root / "bitstreams" / "my_upload.bin.tmp").exists()
+    assert not board_file(fake_repl, "my_upload").exists()
