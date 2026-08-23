@@ -51,6 +51,10 @@ LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 CLOSE_REPLY_TIMEOUT = 2.0
 SHUTDOWN_TIMEOUT = 5.0
 DEMO_SYNC_RETRY = 30.0
+# POST /demos/sync riding out a startup auto-sync still in flight: bounded
+# retries * delay = ~2s worst case before it finally surfaces 409.
+DEMOS_SYNC_BUSY_RETRIES = 20
+DEMOS_SYNC_BUSY_RETRY_DELAY = 0.1
 
 
 def create_app(
@@ -188,9 +192,25 @@ async def demos_sync(request: web.Request) -> web.Response:
         return err
 
     async def go():
-        return web.json_response(await designs.sync_demos(request.app["repl"], request.app["demos_dir"]))
+        return web.json_response(await _sync_demos_retrying_busy(request))
 
     return await _run(request, go())
+
+
+async def _sync_demos_retrying_busy(request: web.Request) -> dict:
+    """Sync is idempotent and often called right as the daemon boots, when
+    the startup auto-sync (``start_demo_sync``) may still be finishing its
+    own run. Rather than bounce that overlap straight to a 409 a caller has
+    to retry themselves, ride out a short, bounded window of ``ReplBusy``
+    before giving up -- the final attempt still surfaces 409 through `_run`
+    exactly as any other genuinely-busy REPL task does."""
+    repl, demos_dir = request.app["repl"], request.app["demos_dir"]
+    for _ in range(DEMOS_SYNC_BUSY_RETRIES - 1):
+        try:
+            return await designs.sync_demos(repl, demos_dir)
+        except ReplBusy:
+            await asyncio.sleep(DEMOS_SYNC_BUSY_RETRY_DELAY)
+    return await designs.sync_demos(repl, demos_dir)  # last attempt: let ReplBusy propagate to `_run`
 
 
 async def start_demo_sync(app: web.Application) -> None:
