@@ -40,6 +40,9 @@ class _FakeOs:
     def remove(self, path: str):
         os.remove(self._p(path))
 
+    def rename(self, src: str, dst: str):
+        os.rename(self._p(src), self._p(dst))
+
     def mkdir(self, path: str):
         os.mkdir(self._p(path))
 

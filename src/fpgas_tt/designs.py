@@ -122,14 +122,20 @@ async def enable_design(runner: ReplRunner, name: str, clock_hz: int | None) -> 
 
 
 def _write_steps(name: str, data: bytes) -> list[str]:
-    steps = ["import binascii\n" f"f = open('/bitstreams/{name}.bin', 'wb')\n"]
+    # Write to a temp name and rename onto the real one as the very last act:
+    # a crash or dropped connection mid-write must never leave a truncated
+    # bitstream visible under its real name (list_designs/enable would treat
+    # it as a valid, complete design).
+    tmp, final = f"{name}.bin.tmp", f"{name}.bin"
+    steps = ["import binascii\n" f"f = open('/bitstreams/{tmp}', 'wb')\n"]
     for i in range(0, len(data), CHUNK):
         b64 = base64.b64encode(data[i:i + CHUNK]).decode("ascii")
         steps.append(f"f.write(binascii.a2b_base64('{b64}'))\n")
     steps.append(
         "f.close()\n"
         "import os\n"
-        f"print(os.stat('/bitstreams/{name}.bin')[6])\n"
+        f"os.rename('/bitstreams/{tmp}', '/bitstreams/{final}')\n"
+        f"print(os.stat('/bitstreams/{final}')[6])\n"
         + REFRESH_CODE
     )
     return steps
@@ -160,6 +166,10 @@ async def evict_uploads(runner: ReplRunner, demo_names: set[str], keep: int = MA
 
 async def sync_demos(runner: ReplRunner, demos_dir: Path) -> dict:
     demos = load_demo_index(demos_dir)
+    if not demos:
+        # Nothing to do: skip the board round trip entirely so an empty (or
+        # absent) demos dir never contends the one-task-at-a-time REPL lock.
+        return {"synced": [], "skipped": []}
     stats = json.loads(await runner.exec(STAT_CODE))
     synced, skipped = [], []
     for name in sorted(demos):

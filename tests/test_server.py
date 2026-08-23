@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 
 import aiohttp
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from fpgas_tt import __version__
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.config import BoardConfig
+from fpgas_tt.designs import ICE40_PREAMBLE
 from fpgas_tt.server import build_parser, create_app, main
 
 CFG = BoardConfig(slug="tt06", kind="asic", switch=1, port=6, hostname="pi-sw1-p6")
@@ -187,3 +189,81 @@ def test_log_level_is_restricted():
     assert parser.parse_args(["--log-level", "DEBUG"]).log_level == "DEBUG"
     with pytest.raises(SystemExit):
         parser.parse_args(["--log-level", "chatty"])
+
+
+DEMOS = Path(__file__).parent / "data" / "demos"
+FPGA_CFG = BoardConfig(slug="fpga-1", kind="fpga", switch=2, port=33, hostname="pi-sw2-p33")
+
+
+@pytest.fixture
+async def fpga_client(aiohttp_client, bridge, fake_repl, tmp_path):
+    # an empty demos dir: auto-sync has nothing to do and the tests control the board contents
+    empty = tmp_path / "nodemos"
+    empty.mkdir()
+    return await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=empty))
+
+
+async def test_fpga_routes_404_on_asic_board(client):
+    routes = (("GET", "/designs"), ("POST", "/designs/x/enable"), ("POST", "/bitstream"), ("POST", "/demos/sync"))
+    for method, path in routes:
+        resp = await client.request(method, path)
+        assert resp.status == 404
+        assert (await resp.json())["error"] == "not an fpga board"
+
+
+async def test_designs_list_enable_and_upload_flow(fpga_client, fake_repl):
+    (fake_repl.root / "bitstreams" / "tt_um_factory_test.bin").write_bytes(ICE40_PREAMBLE)
+    body = await (await fpga_client.get("/designs")).json()
+    assert [d["name"] for d in body["designs"]] == ["tt_um_factory_test"]
+    assert body["enabled"] is None
+
+    resp = await fpga_client.post("/designs/tt_um_factory_test/enable", json={"clock_hz": 100})
+    assert resp.status == 200
+    assert await resp.json() == {"enabled": "tt_um_factory_test", "clock_hz": 100}
+    assert (await fpga_client.post("/designs/nope/enable")).status == 404
+
+    data = ICE40_PREAMBLE + b"\x01" * 500
+    form = aiohttp.FormData()
+    form.add_field("name", "my_design")
+    form.add_field("file", data, filename="my_design.bin", content_type="application/octet-stream")
+    resp = await fpga_client.post("/bitstream", data=form)
+    assert resp.status == 201, await resp.text()
+    assert await resp.json() == {"name": "my_design", "size": len(data), "evicted": []}
+    assert (fake_repl.root / "bitstreams" / "my_design.bin").read_bytes() == data
+    names = [d["name"] for d in (await (await fpga_client.get("/designs")).json())["designs"]]
+    assert names == ["my_design", "tt_um_factory_test"]
+
+
+async def test_upload_validation_errors(fpga_client):
+    form = aiohttp.FormData()
+    form.add_field("name", "Bad Name")
+    form.add_field("file", ICE40_PREAMBLE, filename="x.bin")
+    resp = await fpga_client.post("/bitstream", data=form)
+    assert resp.status == 400
+    assert "name" in (await resp.json())["error"]
+    resp = await fpga_client.post("/bitstream", data=aiohttp.FormData())  # no fields at all
+    assert resp.status == 400
+
+
+async def test_demos_sync_route_and_auto_sync_on_start(aiohttp_client, bridge, fake_repl):
+    c = await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=DEMOS))
+    await wait_for(lambda: (fake_repl.root / "bitstreams" / "tt_um_demo_b.bin").exists(), timeout=5)
+    resp = await c.post("/demos/sync")
+    assert resp.status == 200
+    assert await resp.json() == {"synced": [], "skipped": ["tt_um_demo_a", "tt_um_demo_b"]}
+
+
+async def test_board_absent_gives_503(aiohttp_client, tmp_path):
+    bridge = Bridge(str(tmp_path / "missing"), reopen_interval=0.05)
+    await bridge.start()
+    try:
+        c = await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=tmp_path))
+        resp = await c.get("/designs")
+        assert resp.status == 503
+        assert (await resp.json())["error"] == "board not present"
+    finally:
+        await bridge.stop()
+
+
+def test_parser_demos_dir_default():
+    assert build_parser().parse_args([]).demos_dir == "/usr/share/fpgas-tt/demos"
