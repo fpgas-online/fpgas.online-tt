@@ -407,6 +407,11 @@ async def test_replerror_detail_is_sanitized_before_it_reaches_http(fpga_client,
 
 
 async def test_oversized_multipart_body_rejected_before_touching_repl(fpga_client, fake_repl):
+    # aiohttp can compute this request's total size upfront (every part is
+    # an in-memory bytes/BytesIO payload of known length), so this is
+    # actually caught by the Content-Length pre-check, before the parser
+    # ever runs -- 413, same as the aggregate running-total check below,
+    # since both represent the same "whole body too big" condition.
     form = aiohttp.FormData()
     form.add_field("name", "too_big")
     big = ICE40_PREAMBLE + b"\x01" * (1024 * 1024)  # well over MULTIPART_MAX_BYTES
@@ -415,23 +420,39 @@ async def test_oversized_multipart_body_rejected_before_touching_repl(fpga_clien
     # bytes and recommends exactly this.
     form.add_field("file", io.BytesIO(big), filename="x.bin", content_type="application/octet-stream")
     resp = await fpga_client.post("/bitstream", data=form)
-    assert resp.status == 400
+    assert resp.status == 413
     assert fake_repl.transcript == b""  # never touched the board
 
 
 async def test_oversized_chunked_name_part_rejected_before_touching_repl(fpga_client, fake_repl):
-    # The Content-Length pre-check above only covers a request that declares
-    # one; a chunked body (io.BytesIO fields have no fileno, so aiohttp's
-    # client sends chunked, same as the file-part test above) has none, so
-    # an oversized 'name' part must be bounded the same way 'file' is,
-    # rather than buffered whole via .text().
+    # chunked=True forces no Content-Length header, so the pre-check above
+    # can't apply here regardless of body size -- and this body is well
+    # under MULTIPART_MAX_BYTES anyway, so the running-total check wouldn't
+    # catch it either: only bounding the 'name' part specifically does.
     form = aiohttp.FormData()
     form.add_field("name", io.BytesIO(b"x" * (MULTIPART_NAME_MAX_BYTES + 1)))
     form.add_field("file", io.BytesIO(ICE40_PREAMBLE + b"\x01" * 100), filename="x.bin",
                     content_type="application/octet-stream")
-    resp = await fpga_client.post("/bitstream", data=form)
+    resp = await fpga_client.post("/bitstream", data=form, chunked=True)
     assert resp.status == 400
     assert (await resp.json())["error"] == "name too long"
+    assert fake_repl.transcript == b""  # never touched the board
+
+
+async def test_many_small_junk_multipart_parts_bounded_by_running_total(fpga_client, fake_repl):
+    # No single part is anywhere near either per-field limit, and none is
+    # named 'name' or 'file' -- only a running total across *every* part in
+    # the request catches an unbounded number of small "junk" parts holding
+    # the handler open / growing memory forever. chunked=True forces no
+    # Content-Length header (aiohttp can otherwise compute one upfront for
+    # an all-known-length body like this one, which would let the earlier
+    # pre-check catch it first instead of exercising this running total).
+    form = aiohttp.FormData()
+    junk = b"j" * 70_000
+    for i in range(6):  # 6 * 70_000 = 420_000 > MULTIPART_MAX_BYTES (327_680)
+        form.add_field(f"junk{i}", io.BytesIO(junk))
+    resp = await fpga_client.post("/bitstream", data=form, chunked=True)
+    assert resp.status == 413
     assert fake_repl.transcript == b""  # never touched the board
 
 

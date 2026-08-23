@@ -216,29 +216,36 @@ async def bitstream_upload(request: web.Request) -> web.Response:
     # aiohttp 3.8.4's request.multipart() does not honour Application's
     # client_max_size (fixed in later aiohttp) -- a declared oversized body
     # is rejected here before the parser ever runs; a body with no (or a
-    # lying) Content-Length is instead bounded below by reading the 'file'
-    # part in chunks and bailing out as soon as the aggregate is too big,
-    # rather than buffering it whole first.
+    # lying) Content-Length is instead bounded below by reading every part
+    # in chunks against a running total across the *whole* request, not
+    # just the 'name'/'file' fields -- an unbounded number of otherwise-tiny
+    # unrecognized ("junk") parts must not be able to hold the handler open
+    # or grow memory forever either.
     if request.content_length is not None and request.content_length > MULTIPART_MAX_BYTES:
-        return _json_error(400, f"request body too large (limit {MULTIPART_MAX_BYTES} bytes)")
+        return _json_error(413, f"request body too large (limit {MULTIPART_MAX_BYTES} bytes)")
     name_bytes = bytearray()
     data = bytearray()
+    total = 0
     reader = await request.multipart()
     async for part in reader:
-        if part.name == "name":
-            # BodyPartReader.read()/.text() accumulate the whole part
-            # unbounded -- same risk as the file part below (worse: the
-            # Content-Length pre-check above doesn't cover a chunked
-            # request), so this is bounded the same way.
-            while chunk := await part.read_chunk(MULTIPART_CHUNK):
+        while chunk := await part.read_chunk(MULTIPART_CHUNK):
+            total += len(chunk)
+            if total > MULTIPART_MAX_BYTES:
+                return _json_error(413, f"request body too large (limit {MULTIPART_MAX_BYTES} bytes)")
+            if part.name == "name":
+                # BodyPartReader.read()/.text() accumulate the whole part
+                # unbounded -- same risk as 'file' below (worse: the
+                # Content-Length pre-check above doesn't cover a chunked
+                # request), so this is bounded the same way.
                 name_bytes.extend(chunk)
                 if len(name_bytes) > MULTIPART_NAME_MAX_BYTES:
                     return _json_error(400, "name too long")
-        elif part.name == "file":
-            while chunk := await part.read_chunk(MULTIPART_CHUNK):
+            elif part.name == "file":
                 data.extend(chunk)
                 if len(data) > designs.MAX_BITSTREAM_BYTES:
                     return _json_error(400, f"bitstream too large (limit {designs.MAX_BITSTREAM_BYTES} bytes)")
+            # any other part name: still counted in `total` above (and thus
+            # still bounded), just not otherwise kept.
     name = name_bytes.decode("utf-8", "replace").strip()
     data = bytes(data)
     if not name or not data:
