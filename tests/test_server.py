@@ -212,6 +212,35 @@ async def test_fpga_routes_404_on_asic_board(client):
         assert (await resp.json())["error"] == "not an fpga board"
 
 
+async def test_fpga_only_guard_is_checked_by_identity_not_truthiness(client, monkeypatch):
+    # aiohttp's web.Response is a MutableMapping (for per-response state) and
+    # starts with zero stored items, so len(resp) == 0. On aiohttp 3.8.4 --
+    # Debian bookworm's version, what CI's test-bookworm job runs --
+    # StreamResponse defines no __bool__, so Python falls back to __len__ and
+    # bool(resp) is False even for a genuine 404 error response; newer
+    # aiohttp added an explicit __bool__ that fixes this (so this repro only
+    # showed up under bookworm, not under whatever aiohttp is installed
+    # here). `if (err := _fpga_only(request)):` silently fell through on
+    # 3.8.4 and ran the handler body anyway -- regression: GET /designs on an
+    # asic board did a real REPL call and timed out into a 502 instead of a
+    # 404. Guard against regressing to bare truthiness on *any* aiohttp
+    # version by forcing a response whose __bool__ is hard-wired False
+    # (rather than relying on the installed aiohttp's own __len__/__bool__
+    # behaviour, which is exactly what let this slip through here before).
+    import fpgas_tt.server as server_module
+
+    class DeliberatelyFalsyResponse(server_module.web.Response):
+        def __bool__(self):
+            return False
+
+    falsy_error = DeliberatelyFalsyResponse(status=404)
+    assert not falsy_error  # sanity: this is the exact pathology being guarded against
+
+    monkeypatch.setattr(server_module, "_fpga_only", lambda request: falsy_error)
+    resp = await client.get("/designs")
+    assert resp.status == 404
+
+
 async def test_designs_list_enable_and_upload_flow(fpga_client, fake_repl):
     (fake_repl.root / "bitstreams" / "tt_um_factory_test.bin").write_bytes(ICE40_PREAMBLE)
     body = await (await fpga_client.get("/designs")).json()

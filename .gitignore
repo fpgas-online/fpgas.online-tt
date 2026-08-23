@@ -1,4 +1,5 @@
 .venv/
+.venv-bookworm/
 dist/
 __pycache__/
 *.pyc

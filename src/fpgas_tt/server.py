@@ -130,7 +130,7 @@ async def _run(request: web.Request, coro) -> web.Response:
 
 
 async def designs_list(request: web.Request) -> web.Response:
-    if (err := _fpga_only(request)):
+    if (err := _fpga_only(request)) is not None:
         return err
 
     async def go():
@@ -140,7 +140,7 @@ async def designs_list(request: web.Request) -> web.Response:
 
 
 async def designs_enable(request: web.Request) -> web.Response:
-    if (err := _fpga_only(request)):
+    if (err := _fpga_only(request)) is not None:
         return err
     clock_hz = None
     if request.can_read_body:
@@ -161,7 +161,7 @@ async def designs_enable(request: web.Request) -> web.Response:
 
 
 async def bitstream_upload(request: web.Request) -> web.Response:
-    if (err := _fpga_only(request)):
+    if (err := _fpga_only(request)) is not None:
         return err
     if not request.content_type.startswith("multipart/"):
         return _json_error(400, "multipart form with fields 'name' and 'file' required")
@@ -192,7 +192,7 @@ async def bitstream_upload(request: web.Request) -> web.Response:
 
 
 async def demos_sync(request: web.Request) -> web.Response:
-    if (err := _fpga_only(request)):
+    if (err := _fpga_only(request)) is not None:
         return err
 
     async def go():
