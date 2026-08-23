@@ -71,17 +71,24 @@ class ReplRunner:
             finally:
                 try:
                     await client.write(CTRL_B)
-                    # Wait (briefly) for the friendly prompt to actually come
-                    # back before releasing this client: the very next task
-                    # may subscribe its own client immediately afterwards
-                    # (e.g. sync/eviction loops issue several sessions back
-                    # to back), and if these leftover "leaving raw REPL"
-                    # bytes are still in flight when it does, they land in
-                    # the new session's read stream and are misread as
-                    # interference. Best-effort only -- a failure here must
-                    # never fail the task, which has already succeeded or
-                    # raised by this point.
-                    await session.drain_to_friendly_prompt()
+                    if session.raw:
+                        # We know the board is actually in raw REPL (enter()
+                        # confirmed the banner), so it will genuinely reply
+                        # to this Ctrl-B. Wait (briefly) for that friendly
+                        # prompt before releasing this client: the very next
+                        # task may subscribe its own client immediately
+                        # afterwards (e.g. sync/eviction loops issue several
+                        # sessions back to back), and if these leftover
+                        # "leaving raw REPL" bytes are still in flight when
+                        # it does, they land in the new session's read
+                        # stream and are misread as interference.
+                        # Best-effort only -- a failure here must never fail
+                        # the task, which has already succeeded or raised by
+                        # this point. When we never confirmed raw mode (no
+                        # board, silent board, interference before the
+                        # banner) there is nothing to wait for -- a reply
+                        # may never come -- so Ctrl-B stays fire-and-forget.
+                        await session.drain_to_friendly_prompt()
                 except BoardNotPresent:
                     log.warning("repl: board went away before the session could be closed")
                 finally:
@@ -98,6 +105,7 @@ class _Session:
         self._timeout = timeout
         self._buf = b""
         self._seen = b""  # everything read this session, for error detail
+        self.raw = False  # set once enter() has confirmed the raw REPL banner
 
     async def enter(self) -> None:
         await self._client.write(ENTER_RAW)
@@ -105,6 +113,7 @@ class _Session:
         self._buf = b""  # discard whatever the interrupt produced
         await self._client.write(CTRL_A)
         await self._expect(RAW_BANNER, "raw REPL banner")
+        self.raw = True
 
     async def run(self, code: str) -> str:
         await self._client.write(code.encode("utf-8") + CTRL_D)

@@ -96,7 +96,7 @@ REFRESH_CODE = "tt.shuttle._design_index = None\n"
 
 def _enable_code(name: str, clock_hz: int | None) -> str:
     code = f"tt.shuttle.get({name!r}).enable()\n"
-    if clock_hz:
+    if clock_hz is not None:
         code += f"tt.clock_project_PWM({int(clock_hz)})\n"
     code += "print('enabled')\n"
     return code
@@ -142,7 +142,7 @@ async def write_bitstream(runner: ReplRunner, name: str, data: bytes) -> None:
         raise ReplError(f"board reports {size} bytes after writing {len(data)}", "")
 
 
-async def evict_uploads(runner: ReplRunner, demo_names: set[str], keep: int) -> list[str]:
+async def evict_uploads(runner: ReplRunner, demo_names: set[str], keep: int = MAX_UPLOADS - 1) -> list[str]:
     """Delete the oldest uploads so that at most `keep` remain (demos are never touched)."""
     stats = json.loads(await runner.exec(STAT_CODE))
     uploads = sorted((mtime, n) for n, (_size, mtime) in stats.items() if n not in demo_names)

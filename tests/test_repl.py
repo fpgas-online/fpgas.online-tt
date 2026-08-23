@@ -89,9 +89,14 @@ async def test_no_board(tmp_path):
 async def test_timeout_when_board_is_silent(bridge, fake_board):
     # no FakeRepl running: nothing ever answers Ctrl-A
     runner = ReplRunner(bridge)
+    loop = asyncio.get_running_loop()
+    start = loop.time()
     with pytest.raises(ReplError) as ei:
         await runner.exec("print(1)", timeout=0.3)
     assert "timed out" in str(ei.value)
+    # enter() never confirmed raw mode, so cleanup must not also wait out
+    # LEAVE_DRAIN_TIMEOUT for a friendly prompt that will never come.
+    assert loop.time() - start < 0.8
 
 
 async def test_client_released_even_if_outer_wait_for_cancels_it(bridge, fake_board):

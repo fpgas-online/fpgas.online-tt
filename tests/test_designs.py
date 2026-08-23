@@ -89,6 +89,15 @@ async def test_enable_unknown_design_raises_not_found(runner, fake_repl):
         await designs.enable_design(runner, "nope", clock_hz=None)
 
 
+async def test_enable_design_applies_explicit_zero_clock_hz(runner, fake_repl):
+    # clock_hz=0 is a legitimate explicit value, distinct from "no clock_hz
+    # given" (clock_hz=None) -- it must still reach tt.clock_project_PWM.
+    board_file(fake_repl, "tt_um_demo_a").write_bytes(PRE)
+    out = await designs.enable_design(runner, "tt_um_demo_a", clock_hz=0)
+    assert out == {"enabled": "tt_um_demo_a", "clock_hz": 0}
+    assert fake_repl.tt.clock_log == [0]
+
+
 async def test_write_bitstream_round_trips_and_refreshes_index(runner, fake_repl):
     data = PRE + bytes(range(256)) * 3  # 772 bytes: several chunks, last one partial
     await designs.write_bitstream(runner, "my_upload", data)
