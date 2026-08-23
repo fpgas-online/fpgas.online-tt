@@ -41,6 +41,26 @@ def test_demo_index_loads_and_missing_dir_is_empty(tmp_path):
     assert designs.load_demo_index(tmp_path / "nope") == {}
 
 
+def test_load_demo_index_handles_corrupt_json(tmp_path):
+    (tmp_path / "index.json").write_text("{not valid json")
+    assert designs.load_demo_index(tmp_path) == {}
+
+
+def test_load_demo_index_drops_entries_with_invalid_names(tmp_path):
+    (tmp_path / "index.json").write_text(
+        '{"demos": [{"name": "ok_name"}, {"name": "Bad Name"}, '
+        '{"name": "../etc/passwd"}, {"nope": "no name field"}, "not even a dict"]}'
+    )
+    assert set(designs.load_demo_index(tmp_path)) == {"ok_name"}
+
+
+def test_parse_json_and_parse_int_raise_replerror_on_garbage():
+    with pytest.raises(ReplError):
+        designs._parse_json("this is not json")
+    with pytest.raises(ReplError):
+        designs._parse_int("this is not an int")
+
+
 @pytest.mark.parametrize(
     "name,data,status,msg",
     [
@@ -99,11 +119,22 @@ async def test_enable_design_applies_explicit_zero_clock_hz(runner, fake_repl):
 
 
 async def test_write_bitstream_round_trips_and_refreshes_index(runner, fake_repl):
-    data = PRE + bytes(range(256)) * 3  # 772 bytes: several chunks, last one partial
+    data = PRE + bytes(range(256)) * 5  # 1284 bytes: several CHUNK=1024 steps, last one partial
     await designs.write_bitstream(runner, "my_upload", data)
     assert board_file(fake_repl, "my_upload").read_bytes() == data
     # the shuttle index is rebuilt: the new design is enable-able
     await designs.enable_design(runner, "my_upload", clock_hz=None)
+
+
+async def test_write_bitstream_twice_overwrites_via_rename(runner, fake_repl):
+    # The second write's os.rename lands on top of the first write's final
+    # name -- must not error, and must leave no stray .tmp behind.
+    data1 = PRE + bytes(range(200))
+    data2 = PRE + bytes(range(200))[::-1]
+    await designs.write_bitstream(runner, "my_upload", data1)
+    await designs.write_bitstream(runner, "my_upload", data2)
+    assert board_file(fake_repl, "my_upload").read_bytes() == data2
+    assert not (fake_repl.root / "bitstreams" / "my_upload.bin.tmp").exists()
 
 
 async def test_evict_uploads_keeps_newest_and_never_touches_demos(runner, fake_repl):
@@ -121,11 +152,54 @@ async def test_evict_uploads_keeps_newest_and_never_touches_demos(runner, fake_r
     assert board_file(fake_repl, "tt_um_demo_a").exists()
 
 
-async def test_sync_demos_copies_missing_and_skips_same_size(runner, fake_repl):
+async def test_evict_uploads_skips_names_that_dont_match_name_re(runner, fake_repl):
+    # A .bin file with an unexpected name (not something write_bitstream
+    # would ever produce) must never be interpolated into generated board
+    # code, nor evicted -- just left alone.
+    weird = fake_repl.root / "bitstreams" / "weird name!.bin"
+    weird.write_bytes(PRE)
+    board_file(fake_repl, "valid_upload").write_bytes(PRE)
+    evicted = await designs.evict_uploads(runner, set(), keep=0)
+    assert evicted == ["valid_upload"]
+    assert weird.exists()
+
+
+async def test_sync_demos_syncs_everything_on_a_truly_fresh_board(runner, fake_repl):
+    # No manifest yet: even a demo that happens to already be on the board
+    # with byte-identical content gets (re)written -- there's no record that
+    # it's actually what it claims to be, so nothing is trusted unverified.
     board_file(fake_repl, "tt_um_demo_b").write_bytes((DEMOS / "tt_um_demo_b.bin").read_bytes())
     out = await designs.sync_demos(runner, DEMOS)
-    assert out == {"synced": ["tt_um_demo_a"], "skipped": ["tt_um_demo_b"]}
+    assert out == {"synced": ["tt_um_demo_a", "tt_um_demo_b"], "skipped": []}
     assert board_file(fake_repl, "tt_um_demo_a").read_bytes() == (DEMOS / "tt_um_demo_a.bin").read_bytes()
+    assert board_file(fake_repl, "tt_um_demo_b").read_bytes() == (DEMOS / "tt_um_demo_b.bin").read_bytes()
+
+
+async def test_sync_demos_skips_unchanged_on_a_repeat_run(runner, fake_repl):
+    first = await designs.sync_demos(runner, DEMOS)
+    assert first == {"synced": ["tt_um_demo_a", "tt_um_demo_b"], "skipped": []}
+    second = await designs.sync_demos(runner, DEMOS)
+    assert second == {"synced": [], "skipped": ["tt_um_demo_a", "tt_um_demo_b"]}
+
+
+async def test_sync_demos_resyncs_when_content_changes_even_if_size_matches(runner, fake_repl, tmp_path):
+    # The old size-only comparison would never notice this: iCE40 bitstreams
+    # for one part are typically all the same length, so a released update
+    # to a demo (new content, same size) would have been skipped forever.
+    demos_dir = tmp_path / "demos"
+    demos_dir.mkdir()
+    (demos_dir / "index.json").write_text('{"demos": [{"name": "tt_um_demo_a"}]}')
+    original = (DEMOS / "tt_um_demo_a.bin").read_bytes()
+    (demos_dir / "tt_um_demo_a.bin").write_bytes(original)
+    out1 = await designs.sync_demos(runner, demos_dir)
+    assert out1 == {"synced": ["tt_um_demo_a"], "skipped": []}
+
+    tampered = bytes(b ^ 0xFF for b in original)  # same size, different bytes
+    assert len(tampered) == len(original)
+    (demos_dir / "tt_um_demo_a.bin").write_bytes(tampered)  # simulates an updated demo release
+    out2 = await designs.sync_demos(runner, demos_dir)
+    assert out2 == {"synced": ["tt_um_demo_a"], "skipped": []}
+    assert board_file(fake_repl, "tt_um_demo_a").read_bytes() == tampered
 
 
 async def test_sync_demos_with_empty_index_touches_nothing(runner, fake_repl, tmp_path):
@@ -139,13 +213,29 @@ async def test_sync_demos_with_empty_index_touches_nothing(runner, fake_repl, tm
 async def test_sync_demos_removes_stale_tmp_files(runner, fake_repl):
     # A prior crash mid-write can leave a straggling *.tmp; sync_demos must
     # sweep it before anything else, even though it's not a demo itself.
+    await designs.sync_demos(runner, DEMOS)  # first run: populates the manifest
     stale = fake_repl.root / "bitstreams" / "x.bin.tmp"
     stale.write_bytes(b"partial")
-    board_file(fake_repl, "tt_um_demo_a").write_bytes((DEMOS / "tt_um_demo_a.bin").read_bytes())
-    board_file(fake_repl, "tt_um_demo_b").write_bytes((DEMOS / "tt_um_demo_b.bin").read_bytes())
     out = await designs.sync_demos(runner, DEMOS)
     assert out == {"synced": [], "skipped": ["tt_um_demo_a", "tt_um_demo_b"]}
     assert not stale.exists()
+
+
+async def test_sync_demos_creates_bitstreams_dir_when_missing(runner, fake_repl):
+    import shutil
+
+    shutil.rmtree(fake_repl.root / "bitstreams")
+    out = await designs.sync_demos(runner, DEMOS)
+    assert out == {"synced": ["tt_um_demo_a", "tt_um_demo_b"], "skipped": []}
+    assert (fake_repl.root / "bitstreams").is_dir()
+
+
+async def test_list_designs_handles_missing_bitstreams_dir(runner, fake_repl):
+    import shutil
+
+    shutil.rmtree(fake_repl.root / "bitstreams")
+    body = await designs.list_designs(runner, DEMOS)
+    assert body == {"enabled": None, "designs": []}
 
 
 async def test_write_bitstream_cleans_up_tmp_on_failure(runner, fake_repl, monkeypatch):
