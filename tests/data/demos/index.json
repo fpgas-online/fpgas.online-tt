@@ -1,0 +1,7 @@
+{"demos": [
+  {"name": "tt_um_demo_a", "title": "Demo A", "author": "fpgas.online", "description": "First demo",
+   "docs_url": "https://example.org/a", "repo_url": "https://github.com/fpgas-online/tinytapeout-fpga-demos",
+   "clock_hz": 1000, "pinout": {"ui_in": ["a0","a1","a2","a3","a4","a5","a6","a7"], "uo_out": ["o0","o1","o2","o3","o4","o5","o6","o7"], "uio": ["","","","","","","",""]}},
+  {"name": "tt_um_demo_b", "title": "Demo B", "author": "fpgas.online", "description": "Second demo",
+   "docs_url": "", "repo_url": "", "clock_hz": null, "pinout": {}}
+]}
