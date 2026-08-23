@@ -11,7 +11,14 @@ from fpgas_tt.bridge import Bridge
 from fpgas_tt.config import BoardConfig
 from fpgas_tt.designs import ICE40_PREAMBLE
 from fpgas_tt.repl import ReplBusy, ReplRunner
-from fpgas_tt.server import DEMOS_SYNC_BUSY_RETRY_DELAY, _sync_demos_retrying_busy, build_parser, create_app, main
+from fpgas_tt.server import (
+    DEMOS_SYNC_BUSY_RETRY_DELAY,
+    MULTIPART_NAME_MAX_BYTES,
+    _sync_demos_retrying_busy,
+    build_parser,
+    create_app,
+    main,
+)
 
 CFG = BoardConfig(slug="tt06", kind="asic", switch=1, port=6, hostname="pi-sw1-p6")
 
@@ -409,6 +416,22 @@ async def test_oversized_multipart_body_rejected_before_touching_repl(fpga_clien
     form.add_field("file", io.BytesIO(big), filename="x.bin", content_type="application/octet-stream")
     resp = await fpga_client.post("/bitstream", data=form)
     assert resp.status == 400
+    assert fake_repl.transcript == b""  # never touched the board
+
+
+async def test_oversized_chunked_name_part_rejected_before_touching_repl(fpga_client, fake_repl):
+    # The Content-Length pre-check above only covers a request that declares
+    # one; a chunked body (io.BytesIO fields have no fileno, so aiohttp's
+    # client sends chunked, same as the file-part test above) has none, so
+    # an oversized 'name' part must be bounded the same way 'file' is,
+    # rather than buffered whole via .text().
+    form = aiohttp.FormData()
+    form.add_field("name", io.BytesIO(b"x" * (MULTIPART_NAME_MAX_BYTES + 1)))
+    form.add_field("file", io.BytesIO(ICE40_PREAMBLE + b"\x01" * 100), filename="x.bin",
+                    content_type="application/octet-stream")
+    resp = await fpga_client.post("/bitstream", data=form)
+    assert resp.status == 400
+    assert (await resp.json())["error"] == "name too long"
     assert fake_repl.transcript == b""  # never touched the board
 
 

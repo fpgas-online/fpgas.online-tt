@@ -75,6 +75,7 @@ DEMOS_SYNC_BUSY_RETRY_DELAY = 0.1
 # this daemon is packaged.
 MULTIPART_MAX_BYTES = designs.MAX_BITSTREAM_BYTES + 64 * 1024
 MULTIPART_CHUNK = 8192
+MULTIPART_NAME_MAX_BYTES = 256  # far more than NAME_RE's own 40-char cap ever needs
 CLOCK_HZ_MIN, CLOCK_HZ_MAX = 1, 200_000_000
 # ANSI escapes and other non-printable bytes (board output, possibly
 # corrupted by interference) must not reach an HTTP client verbatim; \n is
@@ -220,17 +221,25 @@ async def bitstream_upload(request: web.Request) -> web.Response:
     # rather than buffering it whole first.
     if request.content_length is not None and request.content_length > MULTIPART_MAX_BYTES:
         return _json_error(400, f"request body too large (limit {MULTIPART_MAX_BYTES} bytes)")
-    name = ""
+    name_bytes = bytearray()
     data = bytearray()
     reader = await request.multipart()
     async for part in reader:
         if part.name == "name":
-            name = (await part.text()).strip()
+            # BodyPartReader.read()/.text() accumulate the whole part
+            # unbounded -- same risk as the file part below (worse: the
+            # Content-Length pre-check above doesn't cover a chunked
+            # request), so this is bounded the same way.
+            while chunk := await part.read_chunk(MULTIPART_CHUNK):
+                name_bytes.extend(chunk)
+                if len(name_bytes) > MULTIPART_NAME_MAX_BYTES:
+                    return _json_error(400, "name too long")
         elif part.name == "file":
             while chunk := await part.read_chunk(MULTIPART_CHUNK):
                 data.extend(chunk)
                 if len(data) > designs.MAX_BITSTREAM_BYTES:
                     return _json_error(400, f"bitstream too large (limit {designs.MAX_BITSTREAM_BYTES} bytes)")
+    name = name_bytes.decode("utf-8", "replace").strip()
     data = bytes(data)
     if not name or not data:
         return _json_error(400, "fields 'name' and 'file' are required")
