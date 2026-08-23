@@ -78,3 +78,14 @@ def fake_board(tmp_path: Path) -> FakeBoard:
                 os.close(fd)
             except OSError:
                 pass
+
+
+@pytest.fixture
+async def fake_repl(fake_board, tmp_path):
+    from tests.fakerepl import FakeRepl  # noqa: PLC0415 - test helper
+
+    (tmp_path / "board").mkdir()
+    repl = FakeRepl(master_fd=fake_board.master, root=tmp_path / "board")
+    repl.start()
+    yield repl
+    await repl.stop()
