@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 from pathlib import Path
 
@@ -357,3 +358,71 @@ async def test_auto_sync_task_survives_unexpected_exception_and_retries(
         await wait_for(lambda: calls["n"] >= 2, timeout=5)
     assert "unexpected exception" in caplog.text
     assert "boom" in caplog.text
+
+
+async def test_board_returning_unparseable_output_gives_502_json_not_500_text(fpga_client, fake_repl, monkeypatch):
+    # A stray print (leftover debug output, board-side interference) before
+    # LIST_CODE's own json.dumps corrupts its stdout so json.loads can't
+    # parse it -- this must still surface as a clean 502 JSON error, not an
+    # unhandled 500 text/plain crash.
+    monkeypatch.setattr(designs, "LIST_CODE", "print('x')\n" + designs.LIST_CODE)
+    resp = await fpga_client.get("/designs")
+    assert resp.status == 502
+    assert resp.content_type == "application/json"
+    body = await resp.json()
+    assert body["error"] == "REPL task failed"
+
+
+async def test_unexpected_exception_in_task_gives_500_json_not_default_text(fpga_client, monkeypatch):
+    async def boom(runner, demos_dir):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(designs, "list_designs", boom)
+    resp = await fpga_client.get("/designs")
+    assert resp.status == 500
+    assert resp.content_type == "application/json"
+    body = await resp.json()
+    assert body["error"] == "internal error"
+    assert body["detail"] == "RuntimeError"
+
+
+async def test_replerror_detail_is_sanitized_before_it_reaches_http(fpga_client, monkeypatch):
+    from fpgas_tt.repl import ReplError
+
+    async def boom(runner, demos_dir):
+        raise ReplError("x", "\x1b[31mRED\x1b[0m\x01\x02bad\nline")
+
+    monkeypatch.setattr(designs, "list_designs", boom)
+    resp = await fpga_client.get("/designs")
+    assert resp.status == 502
+    body = await resp.json()
+    assert body["detail"] == "REDbad\nline"
+
+
+async def test_oversized_multipart_body_rejected_before_touching_repl(fpga_client, fake_repl):
+    form = aiohttp.FormData()
+    form.add_field("name", "too_big")
+    big = ICE40_PREAMBLE + b"\x01" * (1024 * 1024)  # well over MULTIPART_MAX_BYTES
+    # io.BytesIO, not raw bytes: aiohttp warns (ResourceWarning, fatal under
+    # this repo's filterwarnings=error) about sending a large body as raw
+    # bytes and recommends exactly this.
+    form.add_field("file", io.BytesIO(big), filename="x.bin", content_type="application/octet-stream")
+    resp = await fpga_client.post("/bitstream", data=form)
+    assert resp.status == 400
+    assert fake_repl.transcript == b""  # never touched the board
+
+
+async def test_enable_rejects_non_matching_name_before_touching_repl(fpga_client, fake_repl):
+    resp = await fpga_client.post("/designs/not a valid name!/enable")
+    assert resp.status == 404
+    assert fake_repl.transcript == b""  # never touched the board
+
+
+@pytest.mark.parametrize(
+    "clock_hz",
+    [True, "100", 0, -1, 200_000_001, 3.5],
+)
+async def test_enable_rejects_invalid_clock_hz(fpga_client, clock_hz):
+    resp = await fpga_client.post("/designs/some_name/enable", json={"clock_hz": clock_hz})
+    assert resp.status == 400
+    assert "clock_hz" in (await resp.json())["error"]

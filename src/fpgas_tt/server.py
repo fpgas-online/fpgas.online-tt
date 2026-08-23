@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import re
 import socket
 import time
 from pathlib import Path
@@ -57,6 +58,20 @@ DEMO_SYNC_RETRY = 30.0
 # retries * delay = ~1s worst case before it finally surfaces 409.
 DEMOS_SYNC_BUSY_RETRIES = 10
 DEMOS_SYNC_BUSY_RETRY_DELAY = 0.1
+# A little over the bitstream cap so multipart framing overhead never trips
+# this before designs.validate_bitstream gets to give a proper 400. aiohttp
+# >=3.9's request.multipart() honours Application's client_max_size on its
+# own; 3.8.4 (Debian bookworm) does not, so bitstream_upload also checks
+# Content-Length up front and bounds the 'file' part's own read below --
+# belt and braces, since either aiohttp version is in play depending on how
+# this daemon is packaged.
+MULTIPART_MAX_BYTES = designs.MAX_BITSTREAM_BYTES + 64 * 1024
+MULTIPART_CHUNK = 8192
+CLOCK_HZ_MIN, CLOCK_HZ_MAX = 1, 200_000_000
+# ANSI escapes and other non-printable bytes (board output, possibly
+# corrupted by interference) must not reach an HTTP client verbatim; \n is
+# kept so multi-line detail is still readable.
+_UNSAFE_DETAIL_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|[^\x20-\x7e\n]")
 
 
 def create_app(
@@ -67,9 +82,10 @@ def create_app(
     config_error: str | None = None,
     demos_dir: Path | str = DEMOS_DIR_DEFAULT,
 ) -> web.Application:
-    # A little over the bitstream cap so multipart framing overhead never
-    # trips this before designs.validate_bitstream gets to give a proper 400.
-    app = web.Application(client_max_size=designs.MAX_BITSTREAM_BYTES + 64 * 1024)
+    # See MULTIPART_MAX_BYTES: this only fully protects non-multipart bodies
+    # and aiohttp >=3.9's multipart parsing; bitstream_upload has its own
+    # belt-and-braces check for 3.8.4.
+    app = web.Application(client_max_size=MULTIPART_MAX_BYTES)
     app["bridge"] = bridge
     app["config"] = config
     app["version"] = version
@@ -114,6 +130,12 @@ def _fpga_only(request: web.Request) -> web.Response | None:
     return None
 
 
+def _sanitize_detail(text: str) -> str:
+    """Strip ANSI escapes and other non-printable bytes from board output
+    before it reaches an HTTP client; keeps newlines for readability."""
+    return _UNSAFE_DETAIL_RE.sub("", text)
+
+
 async def _run(request: web.Request, coro) -> web.Response:
     """Map task exceptions onto the wire contract."""
     try:
@@ -126,7 +148,15 @@ async def _run(request: web.Request, coro) -> web.Response:
         return _json_error(404, "no such design")
     except ReplError as exc:
         log.warning("task failed: %s: %s", exc, exc.detail[-200:])
-        return _json_error(502, "REPL task failed", exc.detail)
+        return _json_error(502, "REPL task failed", _sanitize_detail(exc.detail))
+    except Exception as exc:
+        # Belt and braces: anything that reaches here is a bug (a board
+        # output parsing gap the designs helpers didn't already catch, or
+        # something else entirely) -- it must still come back as clean JSON,
+        # not aiohttp's default 500 text/plain, and it must be logged with a
+        # traceback since nothing upstream of this point expected it.
+        log.exception("task failed with an unexpected exception")
+        return _json_error(500, "internal error", type(exc).__name__)
 
 
 async def designs_list(request: web.Request) -> web.Response:
@@ -142,6 +172,10 @@ async def designs_list(request: web.Request) -> web.Response:
 async def designs_enable(request: web.Request) -> web.Response:
     if (err := _fpga_only(request)) is not None:
         return err
+    if not designs.NAME_RE.match(request.match_info["name"]):
+        # Not a name the board could ever have -- don't even ask it (and
+        # don't let an unvalidated path segment anywhere near board code).
+        return _json_error(404, "no such design")
     clock_hz = None
     if request.can_read_body:
         try:
@@ -149,8 +183,13 @@ async def designs_enable(request: web.Request) -> web.Response:
         except ValueError:
             return _json_error(400, "body must be JSON")
         clock_hz = body.get("clock_hz") if isinstance(body, dict) else None
-        if clock_hz is not None and not isinstance(clock_hz, int):
-            return _json_error(400, "clock_hz must be an integer")
+        if clock_hz is not None:
+            # bool is a subclass of int in Python -- {"clock_hz": true} must
+            # not silently become clock_hz=1.
+            if isinstance(clock_hz, bool) or not isinstance(clock_hz, int):
+                return _json_error(400, "clock_hz must be an integer")
+            if not (CLOCK_HZ_MIN <= clock_hz <= CLOCK_HZ_MAX):
+                return _json_error(400, f"clock_hz must be between {CLOCK_HZ_MIN} and {CLOCK_HZ_MAX}")
 
     async def go():
         return web.json_response(
@@ -165,15 +204,26 @@ async def bitstream_upload(request: web.Request) -> web.Response:
         return err
     if not request.content_type.startswith("multipart/"):
         return _json_error(400, "multipart form with fields 'name' and 'file' required")
-    name, data = "", b""
+    # aiohttp 3.8.4's request.multipart() does not honour Application's
+    # client_max_size (fixed in later aiohttp) -- a declared oversized body
+    # is rejected here before the parser ever runs; a body with no (or a
+    # lying) Content-Length is instead bounded below by reading the 'file'
+    # part in chunks and bailing out as soon as the aggregate is too big,
+    # rather than buffering it whole first.
+    if request.content_length is not None and request.content_length > MULTIPART_MAX_BYTES:
+        return _json_error(400, f"request body too large (limit {MULTIPART_MAX_BYTES} bytes)")
+    name = ""
+    data = bytearray()
     reader = await request.multipart()
     async for part in reader:
         if part.name == "name":
             name = (await part.text()).strip()
         elif part.name == "file":
-            data = await part.read(decode=False)
-            if len(data) > designs.MAX_BITSTREAM_BYTES:
-                return _json_error(400, f"bitstream too large (limit {designs.MAX_BITSTREAM_BYTES} bytes)")
+            while chunk := await part.read_chunk(MULTIPART_CHUNK):
+                data.extend(chunk)
+                if len(data) > designs.MAX_BITSTREAM_BYTES:
+                    return _json_error(400, f"bitstream too large (limit {designs.MAX_BITSTREAM_BYTES} bytes)")
+    data = bytes(data)
     if not name or not data:
         return _json_error(400, "fields 'name' and 'file' are required")
     demos = designs.load_demo_index(request.app["demos_dir"])
