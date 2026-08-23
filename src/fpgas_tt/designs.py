@@ -181,13 +181,22 @@ READ_MANIFEST_CODE = (
 )
 
 
-def _write_manifest_code(manifest: dict[str, str]) -> str:
+def _write_manifest_code(manifest: dict[str, str], stale: list[str] = ()) -> str:
+    """Writes the new manifest, first removing any `stale` demo .bin (a name
+    that was in the old manifest but isn't in this run's -- dropped from
+    index.json) so it doesn't linger and show up as an "upload"."""
+    lines = []
+    if stale:
+        lines.append("import os\n")
+        for n in stale:
+            path = f"/bitstreams/{n}.bin"
+            lines.append(f"try:\n    os.remove({path!r})\nexcept OSError:\n    pass\n")
+        lines.append(REFRESH_CODE)
     body = json.dumps(manifest)
-    return (
-        f"with open({DEMOS_MANIFEST_PATH!r}, 'w') as _mf:\n"
-        f"    _mf.write({body!r})\n"
-        "print('ok')\n"
-    )
+    lines.append(f"with open({DEMOS_MANIFEST_PATH!r}, 'w') as _mf:\n")
+    lines.append(f"    _mf.write({body!r})\n")
+    lines.append("print('ok')\n")
+    return "".join(lines)
 
 
 def _remove_code(*filenames: str) -> str:
@@ -224,6 +233,12 @@ async def list_designs(runner: ReplRunner, demos_dir: Path) -> dict:
 
 
 async def enable_design(runner: ReplRunner, name: str, clock_hz: int | None) -> dict:
+    if not NAME_RE.match(name):
+        # Not a name the board could ever have -- don't even ask it (and
+        # don't let an unvalidated name anywhere near board code). The HTTP
+        # layer already checks this before calling in; this is
+        # defense-in-depth for any other caller.
+        raise DesignNotFound(name)
     names, _ = await _board_names(runner)
     if name not in names:
         raise DesignNotFound(name)
@@ -245,6 +260,10 @@ def _write_steps(name: str, data: bytes) -> list[str]:
     steps.append(
         "f.close()\n"
         "import os\n"
+        # MicroPython's VfsFat os.rename() raises EEXIST when the
+        # destination already exists (LFS2 doesn't) -- remove it first,
+        # guarded, so re-uploading/re-syncing the same name works on either.
+        f"try:\n    os.remove({final_path!r})\nexcept OSError:\n    pass\n"
         f"os.rename({tmp_path!r}, {final_path!r})\n"
         f"print(os.stat({final_path!r})[6])\n"
         + REFRESH_CODE
@@ -325,9 +344,17 @@ async def sync_demos(runner: ReplRunner, demos_dir: Path) -> dict:
             await write_bitstream(runner, name, data)
             synced.append(name)
         new_manifest[name] = digest
-    # Written once, last, only if every write above actually succeeded: a
+    # Written once, last, only if every write above actually succeeded (a
     # failure partway through leaves the previous manifest in place, so the
     # untouched-by-this-run entries still correctly compare equal next time,
-    # and whatever *did* fail is retried instead of wrongly marked synced.
-    await runner.exec(_write_manifest_code(new_manifest))
+    # and whatever *did* fail is retried instead of wrongly marked synced),
+    # and only if anything actually changed -- a repeat sync with nothing to
+    # do must not flash-write the manifest every time it happens to run.
+    # `stale` (a demo dropped from index.json, so it's in the old manifest
+    # but not this run's) is non-empty only when new_manifest != manifest
+    # already, so that one comparison covers both content and membership
+    # changes; never touches a name outside the manifest (uploads are safe).
+    if new_manifest != manifest:
+        stale = sorted(n for n in manifest if n not in new_manifest and NAME_RE.match(n))
+        await runner.exec(_write_manifest_code(new_manifest, stale))
     return {"synced": synced, "skipped": skipped}

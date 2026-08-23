@@ -109,6 +109,12 @@ async def test_enable_unknown_design_raises_not_found(runner, fake_repl):
         await designs.enable_design(runner, "nope", clock_hz=None)
 
 
+async def test_enable_design_rejects_invalid_name_before_touching_repl(runner, fake_repl):
+    with pytest.raises(designs.DesignNotFound):
+        await designs.enable_design(runner, "Not A Valid Name!", clock_hz=None)
+    assert fake_repl.transcript == b""  # never touched the board
+
+
 async def test_enable_design_applies_explicit_zero_clock_hz(runner, fake_repl):
     # clock_hz=0 is a legitimate explicit value, distinct from "no clock_hz
     # given" (clock_hz=None) -- it must still reach tt.clock_project_PWM.
@@ -135,6 +141,19 @@ async def test_write_bitstream_twice_overwrites_via_rename(runner, fake_repl):
     await designs.write_bitstream(runner, "my_upload", data2)
     assert board_file(fake_repl, "my_upload").read_bytes() == data2
     assert not (fake_repl.root / "bitstreams" / "my_upload.bin.tmp").exists()
+
+
+async def test_write_bitstream_removes_existing_final_name_before_rename(runner, fake_repl):
+    # MicroPython's VfsFat os.rename() raises EEXIST when the destination
+    # already exists (LFS2 doesn't); the fake's rename stays plain POSIX
+    # (which allows overwriting unconditionally either way), so this only
+    # checks the *generated board code* removes the old final name before
+    # renaming onto it -- not that the fake's rename behaves like VfsFat.
+    await designs.write_bitstream(runner, "my_upload", PRE + b"x" * 50)
+    transcript = bytes(fake_repl.transcript)
+    remove_idx = transcript.index(b"os.remove('/bitstreams/my_upload.bin')")
+    rename_idx = transcript.index(b"os.rename(")
+    assert remove_idx < rename_idx
 
 
 async def test_evict_uploads_keeps_newest_and_never_touches_demos(runner, fake_repl):
@@ -200,6 +219,38 @@ async def test_sync_demos_resyncs_when_content_changes_even_if_size_matches(runn
     out2 = await designs.sync_demos(runner, demos_dir)
     assert out2 == {"synced": ["tt_um_demo_a"], "skipped": []}
     assert board_file(fake_repl, "tt_um_demo_a").read_bytes() == tampered
+
+
+async def test_sync_demos_removes_stale_demo_dropped_from_index(runner, fake_repl, tmp_path):
+    demos_dir = tmp_path / "demos"
+    demos_dir.mkdir()
+    (demos_dir / "index.json").write_text('{"demos": [{"name": "tt_um_demo_a"}, {"name": "tt_um_demo_b"}]}')
+    (demos_dir / "tt_um_demo_a.bin").write_bytes((DEMOS / "tt_um_demo_a.bin").read_bytes())
+    (demos_dir / "tt_um_demo_b.bin").write_bytes((DEMOS / "tt_um_demo_b.bin").read_bytes())
+    board_file(fake_repl, "my_upload").write_bytes(PRE)  # unrelated upload, never in any manifest
+
+    out1 = await designs.sync_demos(runner, demos_dir)
+    assert out1 == {"synced": ["tt_um_demo_a", "tt_um_demo_b"], "skipped": []}
+    assert board_file(fake_repl, "tt_um_demo_b").exists()
+
+    # demo_b dropped from the index (e.g. removed in a later release)
+    (demos_dir / "index.json").write_text('{"demos": [{"name": "tt_um_demo_a"}]}')
+    out2 = await designs.sync_demos(runner, demos_dir)
+    assert out2 == {"synced": [], "skipped": ["tt_um_demo_a"]}
+    assert not board_file(fake_repl, "tt_um_demo_b").exists()  # stale demo removed
+    assert board_file(fake_repl, "my_upload").exists()  # never touched -- not in any manifest
+
+
+async def test_sync_demos_skips_manifest_write_when_nothing_changed(runner, fake_repl):
+    await designs.sync_demos(runner, DEMOS)  # first run: writes files + manifest
+    write_pattern = b"open('/bitstreams/.demos.json', 'w')"
+    count_after_first = bytes(fake_repl.transcript).count(write_pattern)
+    assert count_after_first == 1
+
+    out2 = await designs.sync_demos(runner, DEMOS)  # nothing changed
+    assert out2 == {"synced": [], "skipped": ["tt_um_demo_a", "tt_um_demo_b"]}
+    count_after_second = bytes(fake_repl.transcript).count(write_pattern)
+    assert count_after_second == count_after_first  # no additional manifest write
 
 
 async def test_sync_demos_with_empty_index_touches_nothing(runner, fake_repl, tmp_path):
