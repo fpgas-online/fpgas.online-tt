@@ -156,6 +156,27 @@ async def test_write_bitstream_removes_existing_final_name_before_rename(runner,
     assert remove_idx < rename_idx
 
 
+async def test_write_bitstream_reraises_non_enoent_remove_failure(runner, fake_repl, monkeypatch):
+    # The guarded os.remove() before rename must only swallow "it didn't
+    # exist yet" (ENOENT) -- anything else (permissions, I/O, ...) has to
+    # surface as-is, not get masked into a confusing EEXIST from the rename
+    # that follows.
+    from tests.fakerepl import _FakeOs
+
+    board_file(fake_repl, "my_upload").write_bytes(PRE)  # a pre-existing final name to fail removing
+    real_remove = _FakeOs.remove
+
+    def flaky_remove(self, path):
+        if path.endswith("my_upload.bin"):
+            raise PermissionError(13, "Permission denied")
+        return real_remove(self, path)
+
+    monkeypatch.setattr(_FakeOs, "remove", flaky_remove)
+    with pytest.raises(ReplError) as ei:
+        await designs.write_bitstream(runner, "my_upload", PRE + b"x" * 20)
+    assert "Permission denied" in ei.value.detail
+
+
 async def test_evict_uploads_keeps_newest_and_never_touches_demos(runner, fake_repl):
     import os
     import time

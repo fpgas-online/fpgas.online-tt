@@ -271,10 +271,19 @@ def _write_steps(name: str, data: bytes) -> list[str]:
     steps.append(
         "f.close()\n"
         "import os\n"
+        "import errno\n"
         # MicroPython's VfsFat os.rename() raises EEXIST when the
-        # destination already exists (LFS2 doesn't) -- remove it first,
-        # guarded, so re-uploading/re-syncing the same name works on either.
-        f"try:\n    os.remove({final_path!r})\nexcept OSError:\n    pass\n"
+        # destination already exists (LFS2 doesn't) -- remove it first so
+        # re-uploading/re-syncing the same name works on either. Only ENOENT
+        # (it simply didn't exist yet -- the common case) is swallowed; any
+        # other failure (permissions, I/O, ...) is re-raised so the real
+        # cause reaches the user instead of a confusing EEXIST from the
+        # rename that follows.
+        "try:\n"
+        f"    os.remove({final_path!r})\n"
+        "except OSError as e:\n"
+        "    if e.errno != errno.ENOENT:\n"
+        "        raise\n"
         f"os.rename({tmp_path!r}, {final_path!r})\n"
         f"print(os.stat({final_path!r})[6])\n"
         + REFRESH_CODE
