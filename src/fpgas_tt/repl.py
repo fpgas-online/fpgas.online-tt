@@ -25,6 +25,14 @@ CTRL_B = b"\r\x02"
 CTRL_D = b"\x04"
 DETAIL_LIMIT = 2000
 LEAVE_DRAIN_TIMEOUT = 1.0  # bound on waiting for the friendly prompt on the way out
+# A real board echoes readline/pyexec preamble (a re-issued friendly prompt,
+# an echoed \r, ...) before the raw-REPL banner when CTRL_A is sent from the
+# friendly prompt -- enter() scans past it rather than assuming the banner is
+# the very first thing on the wire; this bounds how much can be discarded
+# while looking for it, so a board that never sends the banner still fails
+# fast instead of buffering forever.
+RAW_BANNER_PREAMBLE_CAP = 4096
+DEFAULT_OVERALL_TIMEOUT = 30.0  # floor for exec_steps' whole-session deadline
 
 
 class ReplError(Exception):
@@ -51,21 +59,31 @@ class ReplRunner:
     def busy(self) -> bool:
         return self._lock.locked()
 
-    async def exec(self, code: str, *, timeout: float = 10.0) -> str:
-        return (await self.exec_steps([code], timeout=timeout))[0]
+    async def exec(self, code: str, *, timeout: float = 10.0, overall: float | None = None) -> str:
+        return (await self.exec_steps([code], timeout=timeout, overall=overall))[0]
 
-    async def exec_steps(self, steps: list[str], *, timeout: float = 10.0) -> list[str]:
-        """Enter raw REPL once, run each snippet (Ctrl-D per step), leave with Ctrl-B."""
+    async def exec_steps(self, steps: list[str], *, timeout: float = 10.0, overall: float | None = None) -> list[str]:
+        """Enter raw REPL once, run each snippet (Ctrl-D per step), leave with Ctrl-B.
+
+        `timeout` bounds each individual read; `overall` additionally bounds
+        the whole session (entry through the last step) so a board that
+        dribbles bytes just fast enough to keep beating the per-read timeout
+        can't hang a task forever. Defaults to ``max(DEFAULT_OVERALL_TIMEOUT,
+        timeout)`` when not given explicitly."""
         if self._lock.locked():
             raise ReplBusy("another task is running")
         if not self._bridge.present:
             raise ReplNoBoard("board not present")
+        deadline = overall if overall is not None else max(DEFAULT_OVERALL_TIMEOUT, timeout)
         async with self._lock:
             client = self._bridge.subscribe()
             session = _Session(client, timeout)
             try:
-                await session.enter()
-                return [await session.run(step) for step in steps]
+                async with asyncio.timeout(deadline):
+                    await session.enter()
+                    return [await session.run(step) for step in steps]
+            except TimeoutError as exc:
+                raise ReplError("REPL task exceeded its overall deadline", session._seen) from exc
             except BoardNotPresent as exc:
                 raise ReplNoBoard("board not present") from exc
             finally:
@@ -112,7 +130,18 @@ class _Session:
         await asyncio.sleep(0.05)
         self._buf = b""  # discard whatever the interrupt produced
         await self._client.write(CTRL_A)
-        await self._expect(RAW_BANNER, "raw REPL banner")
+        # A real board, moving from the friendly prompt into raw REPL, first
+        # echoes readline/pyexec preamble (e.g. "\r\n>>> \r\n" -- an echo of
+        # the \r, a re-issued prompt, pyexec's newline) *before* the actual
+        # "raw REPL; CTRL-B to exit\r\n>" banner. Scan for the banner instead
+        # of assuming it's the first thing on the wire, discarding (but
+        # keeping in `_seen`) anything before it; bounded so a board that
+        # never sends the banner still fails instead of buffering forever.
+        while RAW_BANNER not in self._buf:
+            if len(self._buf) > RAW_BANNER_PREAMBLE_CAP:
+                raise ReplError("REPL protocol mismatch waiting for raw REPL banner", self._seen)
+            await self._fill("raw REPL banner")
+        _, self._buf = self._buf.split(RAW_BANNER, 1)
         self.raw = True
 
     async def run(self, code: str) -> str:
@@ -129,7 +158,8 @@ class _Session:
         """Best-effort: consume bytes until the friendly ``>>> `` prompt is
         seen (or a bounded timeout elapses), so the board has actually left
         raw REPL before this client is released. Never raises."""
-        buf = self._buf
+        buf = b""  # start fresh: anything already in self._buf predates the
+        # Ctrl-B just sent and must not be mistaken for its reply.
         try:
             async with asyncio.timeout(LEAVE_DRAIN_TIMEOUT):
                 while FRIENDLY_PROMPT not in buf:
@@ -147,6 +177,13 @@ class _Session:
         except asyncio.TimeoutError as exc:
             raise ReplError(f"REPL task timed out waiting for {what}", self._seen) from exc
         if data is None:
+            if self._client.dropped:
+                # The bridge dropped us for falling too far behind (buffer
+                # overrun) -- the board is still there, our stream just got
+                # cut. Distinct from ReplNoBoard, which means no board at
+                # all; conflating the two would have callers retry a task
+                # that's actually fine, waiting on a board that's fine too.
+                raise ReplError("REPL task lost its stream (board output overran the buffer)", self._seen)
             raise ReplNoBoard("board not present")
         self._buf += data
         self._seen += data

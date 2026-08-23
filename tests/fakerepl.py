@@ -18,6 +18,10 @@ from pathlib import Path
 
 RAW_BANNER = b"raw REPL; CTRL-B to exit\r\n>"
 FRIENDLY_BANNER = b"\r\nMicroPython v1.25 fake; FPGA\r\nType \"help()\" for more information.\r\n>>> "
+# What a real board echoes for \r\x01 (CTRL_A) *before* the raw-REPL banner:
+# readline's echo of the \r, a re-issued friendly prompt, and pyexec's own
+# newline -- present on every real entry, not just an "interference" case.
+DEFAULT_RAW_PREAMBLE = b"\r\n>>> \r\n"
 
 
 class _FakeOs:
@@ -123,6 +127,7 @@ class FakeRepl:
     master_fd: int
     root: Path
     echo_junk: bytes = b""  # bytes "someone else" injects after the banner (interference tests)
+    raw_preamble: bytes = DEFAULT_RAW_PREAMBLE  # pre-banner echo a real board sends; tests may override/blow it up
     transcript: bytearray = field(default_factory=bytearray)
 
     def __post_init__(self) -> None:
@@ -196,7 +201,7 @@ class FakeRepl:
                     if b"\x01" in buf:
                         buf = buf.split(b"\x01", 1)[1]
                         raw = True
-                        await self._write(RAW_BANNER + self.echo_junk)
+                        await self._write(self.raw_preamble + RAW_BANNER + self.echo_junk)
                         continue
                     buf = b""  # friendly mode: swallow (Ctrl-C, newlines, ...)
                     break

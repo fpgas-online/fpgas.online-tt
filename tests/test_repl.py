@@ -1,9 +1,10 @@
 import asyncio
+import contextlib
 
 import pytest
 
 from fpgas_tt.bridge import Bridge
-from fpgas_tt.repl import ReplBusy, ReplError, ReplNoBoard, ReplRunner
+from fpgas_tt.repl import ReplBusy, ReplError, ReplNoBoard, ReplRunner, _Session
 
 
 async def wait_for(predicate, timeout=2.0):
@@ -108,3 +109,72 @@ async def test_client_released_even_if_outer_wait_for_cancels_it(bridge, fake_bo
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(runner.exec("print(1)"), 0.2)
     assert bridge.clients == 0
+
+
+class _JunkClient:
+    """A minimal Client stub that always echoes junk, never the raw-REPL
+    banner -- used to test enter()'s preamble cap deterministically, without
+    depending on how the real Bridge/pty happens to chunk reads."""
+
+    dropped = False
+
+    async def write(self, data: bytes) -> None:
+        pass
+
+    async def read(self) -> bytes:
+        return b"x" * 100
+
+
+async def test_enter_gives_up_after_too_much_pre_banner_preamble():
+    # A real board echoes some preamble (readline/pyexec) before the actual
+    # raw-REPL banner on entry (see test_exec_returns_stdout_and_restores_
+    # friendly_repl and friends, which exercise that path via the fake's
+    # default preamble) -- but a board that never sends the banner at all
+    # must not make enter() buffer forever.
+    session = _Session(_JunkClient(), timeout=5.0)
+    with pytest.raises(ReplError) as ei:
+        await session.enter()
+    assert "raw REPL banner" in str(ei.value)
+
+
+async def test_enter_scans_past_a_larger_than_usual_preamble(bridge, fake_repl):
+    # The fake's default preamble already exercises the common case (every
+    # other test in this file goes through it); this checks a longer one --
+    # still under the cap -- is tolerated too, not just the exact default.
+    fake_repl.raw_preamble = b"\r\n>>> \r\n" * 20
+    runner = ReplRunner(bridge)
+    assert await runner.exec("print(1)") == "1\r\n"
+
+
+async def test_overall_deadline_fires_even_though_each_read_beats_its_own_timeout(bridge, fake_board):
+    # A board that dribbles bytes just fast enough to keep beating the
+    # per-read timeout must still be bounded by the overall session deadline.
+    async def dribble():
+        while True:
+            await fake_board.send(b"x")
+            await asyncio.sleep(0.05)
+
+    task = asyncio.create_task(dribble())
+    try:
+        runner = ReplRunner(bridge)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        with pytest.raises(ReplError) as ei:
+            await runner.exec("print(1)", timeout=5.0, overall=0.3)
+        assert "overall deadline" in str(ei.value)
+        assert loop.time() - start < 2.0  # nowhere near the 5s per-read timeout
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_client_dropped_for_buffer_overrun_raises_replerror_not_noboard(bridge, fake_repl, monkeypatch):
+    import fpgas_tt.bridge as bridge_module
+
+    monkeypatch.setattr(bridge_module, "MAX_CLIENT_BUFFER", 8)  # tiny: any real reply overruns it
+    runner = ReplRunner(bridge)
+    with pytest.raises(ReplError) as ei:
+        await runner.exec("print(1)")
+    assert not isinstance(ei.value, ReplNoBoard)
+    assert "overran the buffer" in str(ei.value)
