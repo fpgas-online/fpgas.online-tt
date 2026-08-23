@@ -12,6 +12,7 @@ import builtins
 import contextlib
 import io
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -197,9 +198,13 @@ class FakeRepl:
                     buf = b""  # friendly mode: swallow (Ctrl-C, newlines, ...)
                     break
                 # raw mode
-                if buf.startswith(b"\x02"):
+                if buf.startswith(b"\r\x02") or buf.startswith(b"\x02"):
+                    # ReplRunner always sends CTRL_B as b"\r\x02" (the leading
+                    # \r is a defensive "clear any partial line" byte, as with
+                    # ENTER_RAW); a bare \x02 is also accepted.
+                    n = 2 if buf.startswith(b"\r\x02") else 1
                     raw = False
-                    buf = buf[1:]
+                    buf = buf[n:]
                     await self._write(FRIENDLY_BANNER)
                     continue
                 if b"\x04" not in buf:
@@ -215,6 +220,13 @@ class FakeRepl:
         # a later) raw-REPL session, so `self._globals` persists across
         # calls rather than being rebuilt each time.
         stdout, stderr = io.StringIO(), io.StringIO()
+        # The daemon's snippets do `import os` (real board behaviour); make
+        # that resolve to the sandboxed `self.fos` rather than the host's
+        # real `os` module, which would otherwise shadow our `os` global
+        # and let the snippet see (and touch) the real filesystem.
+        sentinel = object()
+        prior = sys.modules.get("os", sentinel)
+        sys.modules["os"] = self.fos
         try:
             with contextlib.redirect_stdout(stdout):
                 exec(code, self._globals)  # noqa: S102 - test double
@@ -223,4 +235,9 @@ class FakeRepl:
                 f'Traceback (most recent call last):\r\n  File "<stdin>", line 1, in <module>\r\n'
                 f"{type(exc).__name__}: {exc}\r\n"
             )
+        finally:
+            if prior is sentinel:
+                del sys.modules["os"]
+            else:
+                sys.modules["os"] = prior
         return stdout.getvalue().replace("\n", "\r\n"), stderr.getvalue()

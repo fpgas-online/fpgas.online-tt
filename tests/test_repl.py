@@ -48,6 +48,16 @@ async def test_exec_steps_runs_several_snippets_in_one_session(bridge, fake_repl
     assert fake_repl.transcript.count(b"\x01") == 1  # one raw-REPL entry
 
 
+async def test_back_to_back_sessions_do_not_interfere(bridge, fake_repl):
+    # A new session started the instant the previous one returns must not see
+    # the outgoing session's "leaving raw REPL" bytes leak into its own read
+    # stream (regression: the two clients raced for those bytes).
+    runner = ReplRunner(bridge)
+    assert await runner.exec("print(1)") == "1\r\n"
+    assert await runner.exec("print(2)") == "2\r\n"
+    assert await runner.exec("print(3)") == "3\r\n"
+
+
 async def test_concurrent_tasks_are_refused_not_queued(bridge, fake_repl):
     runner = ReplRunner(bridge)
     first = asyncio.create_task(runner.exec("import time\nprint('slow')", timeout=5))

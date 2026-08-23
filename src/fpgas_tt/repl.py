@@ -18,11 +18,13 @@ from fpgas_tt.bridge import BoardNotPresent, Bridge, Client
 log = logging.getLogger(__name__)
 
 RAW_BANNER = b"raw REPL; CTRL-B to exit\r\n>"
+FRIENDLY_PROMPT = b">>> "  # every MicroPython friendly-REPL banner ends with this
 ENTER_RAW = b"\r\x03\x03"  # interrupt anything running (twice, like mpremote)
 CTRL_A = b"\r\x01"
 CTRL_B = b"\r\x02"
 CTRL_D = b"\x04"
 DETAIL_LIMIT = 2000
+LEAVE_DRAIN_TIMEOUT = 1.0  # bound on waiting for the friendly prompt on the way out
 
 
 class ReplError(Exception):
@@ -69,12 +71,24 @@ class ReplRunner:
             finally:
                 try:
                     await client.write(CTRL_B)
+                    # Wait (briefly) for the friendly prompt to actually come
+                    # back before releasing this client: the very next task
+                    # may subscribe its own client immediately afterwards
+                    # (e.g. sync/eviction loops issue several sessions back
+                    # to back), and if these leftover "leaving raw REPL"
+                    # bytes are still in flight when it does, they land in
+                    # the new session's read stream and are misread as
+                    # interference. Best-effort only -- a failure here must
+                    # never fail the task, which has already succeeded or
+                    # raised by this point.
+                    await session.drain_to_friendly_prompt()
                 except BoardNotPresent:
                     log.warning("repl: board went away before the session could be closed")
                 finally:
-                    # However CTRL_B above went -- delivered, BoardNotPresent, or some
-                    # other exception (e.g. an outer wait_for's CancelledError) -- this
-                    # client must never leak: unsubscribe it from the bridge no matter what.
+                    # However the cleanup above went -- delivered, timed out,
+                    # BoardNotPresent, or some other exception (e.g. an outer
+                    # wait_for's CancelledError) -- this client must never
+                    # leak: unsubscribe it from the bridge no matter what.
                     client.close()
 
 
@@ -101,6 +115,21 @@ class _Session:
         if err:
             raise ReplError("REPL task failed", err)
         return out.decode("utf-8", "replace")
+
+    async def drain_to_friendly_prompt(self) -> None:
+        """Best-effort: consume bytes until the friendly ``>>> `` prompt is
+        seen (or a bounded timeout elapses), so the board has actually left
+        raw REPL before this client is released. Never raises."""
+        buf = self._buf
+        try:
+            async with asyncio.timeout(LEAVE_DRAIN_TIMEOUT):
+                while FRIENDLY_PROMPT not in buf:
+                    data = await self._client.read()
+                    if data is None:
+                        return
+                    buf += data
+        except (TimeoutError, BoardNotPresent):
+            pass
 
     # -- framing helpers --
     async def _fill(self, what: str) -> None:
