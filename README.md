@@ -35,13 +35,17 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   | `GET /designs` | `{"enabled": str\|null, "designs": [{"name", "title", "author", "description", "docs_url", "repo_url", "clock_hz", "pinout", "source": "demo"\|"upload"}, ...]}` — every `.bin` under `/bitstreams`, demo metadata merged in from `index.json` when it matches a name |
   | `POST /designs/{name}/enable` | body `{"clock_hz": int}` (optional) → `{"enabled": name, "clock_hz": int\|null}` |
   | `POST /bitstream` | multipart form (`name`, `file`) → `201 {"name", "size", "evicted": [str, ...]}`; rejects names that collide with a demo, non-`[a-z0-9_]{1,40}` names, oversize (>256 KiB) or non-iCE40 files (400); evicts the oldest non-demo uploads first so at most 16 uploads remain |
-  | `POST /demos/sync` | (re)writes any demo whose on-disk size differs from what's on the board → `{"synced": [str, ...], "skipped": [str, ...]}`; waits up to ~1 s for a running task before answering 409 |
+  | `POST /demos/sync` | (re)writes any demo whose sha1 no longer matches a manifest kept on the board (`/bitstreams/.demos.json`) — a same-size content update is still noticed, unlike a plain size comparison → `{"synced": [str, ...], "skipped": [str, ...]}`; waits up to ~1 s for a running task before answering 409 |
 
   Non-fpga boards get `404 {"error": "not an fpga board", "detail": ""}` on
   all four. Other error shapes (`{"error": str, "detail": str}`): `503 board
   not present`, `409 another task is running` (or a demo-name collision on
-  upload), `404 no such design`, `502 REPL task failed` (detail is the
-  board's traceback, truncated), `400` for validation failures.
+  upload), `404 no such design` (including a name that could never be
+  valid — rejected before the board is asked), `502 REPL task failed`
+  (detail is the board's traceback, ANSI/non-printable bytes stripped and
+  truncated), `400` for validation failures, `500 internal error` for
+  anything unexpected (logged with a traceback; always JSON, never a bare
+  crash page).
 - `--demos-dir` (default `/usr/share/fpgas-tt/demos`) points at the demo
   bitstream set (`index.json` + `<name>.bin` files). On fpga boards, once the
   board is first present the daemon runs one `/demos/sync` automatically in

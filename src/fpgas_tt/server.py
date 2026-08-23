@@ -16,10 +16,18 @@ The four design/bitstream/demo routes return 404
 ``{"error": "not an fpga board", "detail": ""}`` on non-fpga boards, and map
 ``ReplRunner``/``designs`` exceptions onto the wire contract: 503 board not
 present, 409 another task is running (or a demo-name collision on upload),
-404 no such design, 502 REPL task failed (with detail), 400 validation
-errors. On startup, fpga boards get a background task that waits for the
-board to be present and runs ``designs.sync_demos`` once, retrying every 30 s
-on failure.
+404 no such design (including a name POSTed to /designs/{name}/enable that
+could never be valid -- rejected before the REPL is touched), 502 REPL task
+failed (with detail -- ANSI/non-printable bytes stripped, \n kept), 400
+validation errors, 500 internal error (an unexpected exception, logged with
+a traceback; always JSON, never aiohttp's default text/plain). On startup,
+fpga boards get a background task that waits for the board to be present
+and runs ``designs.sync_demos`` once, retrying every 30 s on failure (and
+surviving -- logging, then retrying -- any exception, not just REPL ones).
+``designs.sync_demos`` compares each demo's sha1 against a manifest kept on
+the board, not just its size, so a same-size content update is still
+noticed; POST /demos/sync itself rides out up to ~1 s of a task already in
+flight (e.g. that same startup sync) before answering 409.
 """
 
 from __future__ import annotations

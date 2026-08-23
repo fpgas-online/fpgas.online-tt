@@ -8,7 +8,9 @@ and must be reset after the directory changes; ``tt.clock_project_PWM(hz)`` sets
 Demo sync tracks a sha1 manifest at /bitstreams/.demos.json ({name: sha1 hex}) rather than
 just comparing sizes -- same-size content changes (common: all of one part's iCE40 bitstreams
 share a length) would otherwise never be noticed. write_bitstream's overall REPL deadline
-scales with payload size (60s + 1s/8KiB) on top of ReplRunner's default.
+scales with payload size (60s + 1s/8KiB) on top of ReplRunner's default. Writes go up in
+CHUNK=1024-byte raw steps (1368 base64 chars each on the wire) -- fewer round trips than the
+original 256.
 """
 
 from __future__ import annotations
