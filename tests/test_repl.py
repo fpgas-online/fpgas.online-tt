@@ -4,7 +4,15 @@ import contextlib
 import pytest
 
 from fpgas_tt.bridge import Bridge
-from fpgas_tt.repl import ReplBusy, ReplError, ReplNoBoard, ReplRunner, _Session
+from fpgas_tt.repl import (
+    DEFAULT_OVERALL_TIMEOUT,
+    ReplBusy,
+    ReplError,
+    ReplNoBoard,
+    ReplRunner,
+    _default_overall,
+    _Session,
+)
 
 
 async def wait_for(predicate, timeout=2.0):
@@ -178,3 +186,12 @@ async def test_client_dropped_for_buffer_overrun_raises_replerror_not_noboard(br
         await runner.exec("print(1)")
     assert not isinstance(ei.value, ReplNoBoard)
     assert "overran the buffer" in str(ei.value)
+
+
+def test_default_overall_scales_with_timeout_and_step_count():
+    # enable_design's actual case: a single step at timeout=30 used to leave
+    # entry and the SPI-load step sharing that same 30s overall budget.
+    assert _default_overall(timeout=30.0, n_steps=1) == 60.0
+    assert _default_overall(timeout=10.0, n_steps=3) == 40.0  # 10 * (3 + 1)
+    # the floor still applies for small timeouts/step counts.
+    assert _default_overall(timeout=1.0, n_steps=1) == DEFAULT_OVERALL_TIMEOUT

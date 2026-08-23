@@ -50,6 +50,14 @@ class ReplNoBoard(ReplError):
     pass
 
 
+def _default_overall(timeout: float, n_steps: int) -> float:
+    """The whole-session deadline used when `overall` isn't given explicitly:
+    scaled by step count (+1 for entry) so a single big-timeout step (e.g.
+    enable_design's SPI load) doesn't have to share that one timeout's worth
+    of budget between entry and the step itself."""
+    return max(DEFAULT_OVERALL_TIMEOUT, timeout * (n_steps + 1))
+
+
 class ReplRunner:
     def __init__(self, bridge: Bridge) -> None:
         self._bridge = bridge
@@ -68,13 +76,13 @@ class ReplRunner:
         `timeout` bounds each individual read; `overall` additionally bounds
         the whole session (entry through the last step) so a board that
         dribbles bytes just fast enough to keep beating the per-read timeout
-        can't hang a task forever. Defaults to ``max(DEFAULT_OVERALL_TIMEOUT,
-        timeout)`` when not given explicitly."""
+        can't hang a task forever. See `_default_overall` for the default
+        when not given explicitly."""
         if self._lock.locked():
             raise ReplBusy("another task is running")
         if not self._bridge.present:
             raise ReplNoBoard("board not present")
-        deadline = overall if overall is not None else max(DEFAULT_OVERALL_TIMEOUT, timeout)
+        deadline = overall if overall is not None else _default_overall(timeout, len(steps))
         async with self._lock:
             client = self._bridge.subscribe()
             session = _Session(client, timeout)
