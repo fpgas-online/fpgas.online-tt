@@ -40,6 +40,13 @@ DEMOS_MANIFEST_PATH = "/bitstreams/.demos.json"
 # upload isn't bounded by the same deadline as a tiny one.
 WRITE_OVERALL_BASE = 60.0
 WRITE_OVERALL_PER_BYTE = 1.0 / 8192
+# enable_design's own overall deadline: the site proxy in front of this
+# daemon has its own read timeouts (30s/45s) -- the default overall this
+# call would otherwise get (60s, from ReplRunner's step-scaled default for
+# a single timeout=30.0 step) exceeds the shorter of those, so the client
+# would see a raw connection reset instead of a clean REPL-task-exceeded-
+# its-deadline error. Comfortably under both.
+ENABLE_OVERALL_TIMEOUT = 25.0
 
 
 class ValidationError(Exception):
@@ -242,7 +249,11 @@ async def enable_design(runner: ReplRunner, name: str, clock_hz: int | None) -> 
     names, _ = await _board_names(runner)
     if name not in names:
         raise DesignNotFound(name)
-    await runner.exec(_enable_code(name, clock_hz), timeout=30.0)  # the SPI load takes a few seconds
+    # timeout (per-read) stays 30s -- the SPI load takes a few seconds and
+    # any single read waiting on it is normal; overall is intentionally
+    # tighter (see ENABLE_OVERALL_TIMEOUT) so the whole call still fails
+    # cleanly before the site proxy would have reset the connection anyway.
+    await runner.exec(_enable_code(name, clock_hz), timeout=30.0, overall=ENABLE_OVERALL_TIMEOUT)
     return {"enabled": name, "clock_hz": clock_hz}
 
 
@@ -335,6 +346,14 @@ async def sync_demos(runner: ReplRunner, demos_dir: Path) -> dict:
         src = Path(demos_dir) / f"{name}.bin"
         if not src.exists():
             log.warning("demos: %s listed in index.json but %s is missing", name, src)
+            if name in manifest:
+                # Still listed in the index -- just can't verify it right
+                # now. Carry the old entry forward unchanged so it's neither
+                # re-synced (we have no bytes to sync) nor, worse, evicted as
+                # "stale" by the pass below (which must only ever act on a
+                # demo actually dropped from the index, not a transiently
+                # unreadable file for one still in it).
+                new_manifest[name] = manifest[name]
             continue
         data = src.read_bytes()
         digest = hashlib.sha1(data).hexdigest()  # noqa: S324 - identity check, not a security digest
@@ -350,11 +369,11 @@ async def sync_demos(runner: ReplRunner, demos_dir: Path) -> dict:
     # and whatever *did* fail is retried instead of wrongly marked synced),
     # and only if anything actually changed -- a repeat sync with nothing to
     # do must not flash-write the manifest every time it happens to run.
-    # `stale` (a demo dropped from index.json, so it's in the old manifest
-    # but not this run's) is non-empty only when new_manifest != manifest
-    # already, so that one comparison covers both content and membership
-    # changes; never touches a name outside the manifest (uploads are safe).
+    # `stale` is keyed off the *index* (demos), not new_manifest: a name
+    # missing from new_manifest only because its file was momentarily
+    # unreadable this run (handled above) must never be treated the same as
+    # one genuinely dropped from index.json -- only the latter is stale.
     if new_manifest != manifest:
-        stale = sorted(n for n in manifest if n not in new_manifest and NAME_RE.match(n))
+        stale = sorted(n for n in manifest if n not in demos and NAME_RE.match(n))
         await runner.exec(_write_manifest_code(new_manifest, stale))
     return {"synced": synced, "skipped": skipped}

@@ -241,6 +241,30 @@ async def test_sync_demos_removes_stale_demo_dropped_from_index(runner, fake_rep
     assert board_file(fake_repl, "my_upload").exists()  # never touched -- not in any manifest
 
 
+async def test_sync_demos_leaves_board_copy_when_source_file_temporarily_missing(runner, fake_repl, tmp_path, caplog):
+    # Regression: a demo still listed in index.json whose .bin is (perhaps
+    # transiently) missing from the demos dir must NOT be treated the same
+    # as one genuinely dropped from the index (the test above) -- that
+    # would evict a perfectly good, still-wanted board copy.
+    demos_dir = tmp_path / "demos"
+    demos_dir.mkdir()
+    (demos_dir / "index.json").write_text('{"demos": [{"name": "tt_um_demo_a"}, {"name": "tt_um_demo_b"}]}')
+    (demos_dir / "tt_um_demo_a.bin").write_bytes((DEMOS / "tt_um_demo_a.bin").read_bytes())
+    (demos_dir / "tt_um_demo_b.bin").write_bytes((DEMOS / "tt_um_demo_b.bin").read_bytes())
+
+    out1 = await designs.sync_demos(runner, demos_dir)
+    assert out1 == {"synced": ["tt_um_demo_a", "tt_um_demo_b"], "skipped": []}
+
+    # tt_um_demo_b's source file goes missing -- index.json is unchanged.
+    (demos_dir / "tt_um_demo_b.bin").unlink()
+    with caplog.at_level("WARNING", logger="fpgas_tt.designs"):
+        out2 = await designs.sync_demos(runner, demos_dir)
+    assert out2 == {"synced": [], "skipped": ["tt_um_demo_a"]}
+    assert board_file(fake_repl, "tt_um_demo_b").exists()  # untouched, NOT evicted
+    assert "tt_um_demo_b" in caplog.text
+    assert "missing" in caplog.text
+
+
 async def test_sync_demos_skips_manifest_write_when_nothing_changed(runner, fake_repl):
     await designs.sync_demos(runner, DEMOS)  # first run: writes files + manifest
     write_pattern = b"open('/bitstreams/.demos.json', 'w')"
