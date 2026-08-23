@@ -1,14 +1,15 @@
 """HTTP/WebSocket front end for the bridge, and the ``fpgas-tt`` CLI.
 
 Endpoints:
-  GET /health              JSON status used by the site's status pill
-  WS  /serial               the bridge: binary frames <-> board bytes; text frames
-                             from the server are JSON events; text frames from the
-                             client are written to the board as UTF-8 bytes.
-  GET /designs              (fpga boards only) list bitstreams + which is enabled
-  POST /designs/{name}/enable  (fpga boards only) load a bitstream, optional clock_hz
-  POST /bitstream           (fpga boards only) upload a bitstream (multipart: name, file)
-  POST /demos/sync          (fpga boards only) (re)sync the on-disk demo set onto the board
+  GET  /health                  JSON status used by the site's status pill
+  WS   /serial                  the bridge: binary frames <-> board bytes; text
+                                 frames from the server are JSON events; text
+                                 frames from the client are written to the board
+                                 as UTF-8 bytes.
+  GET  /designs                 (fpga only) list bitstreams + which is enabled
+  POST /designs/{name}/enable   (fpga only) load a bitstream, optional clock_hz
+  POST /bitstream               (fpga only) upload a bitstream (multipart: name, file)
+  POST /demos/sync              (fpga only) (re)sync the on-disk demo set onto the board
 
 The four design/bitstream/demo routes return 404
 ``{"error": "not an fpga board", "detail": ""}`` on non-fpga boards, and map
