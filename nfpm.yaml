@@ -25,5 +25,11 @@ contents:
   - src: debian/60-fpgas-tt.rules
     dst: /etc/udev/rules.d/60-fpgas-tt.rules
     type: config
+  # demo bitstreams (fpgas-online-tt-demos) install here; the daemon's
+  # --demos-dir default points at it, so the directory always exists
+  - dst: /usr/share/fpgas-tt/demos
+    type: dir
+    file_info:
+      mode: 0755
 scripts:
   postinstall: debian/postinstall.sh
