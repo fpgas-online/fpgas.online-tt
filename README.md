@@ -26,10 +26,35 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
 - Discovers which board it is from its hostname (`pi-sw<switch>-p<port>`) and
   `/etc/fpgas-online/tt-boards.yaml` (baked into the Pi NFS root by
   fpgas.online-infra). Unknown hostname ⇒ plain `asic` bridge.
+- On `kind: fpga` boards, four extra routes manage bitstreams on the board's
+  raw MicroPython REPL — a task run through the bridge like any other client,
+  never a second owner of the port:
 
-Later phases add bitstream upload / design listing (FPGA boards) and the
-KianV boot macro; they are tasks that go *through* the bridge as clients —
-there is only ever one owner of the serial port.
+  | Route | Description |
+  |-------|-------------|
+  | `GET /designs` | `{"enabled": str\|null, "designs": [{"name", "title", "author", "description", "docs_url", "repo_url", "clock_hz", "pinout", "source": "demo"\|"upload"}, ...]}` — every `.bin` under `/bitstreams`, demo metadata merged in from `index.json` when it matches a name |
+  | `POST /designs/{name}/enable` | body `{"clock_hz": int}` (optional) → `{"enabled": name, "clock_hz": int\|null}`; bounded to a 25 s overall REPL deadline (below the site proxy's own 30 s/45 s read timeouts, so a stuck SPI load still gets a clean 502 from this daemon instead of the client seeing a raw connection reset) |
+  | `POST /bitstream` | multipart form (`name`, `file`) → `201 {"name", "size", "evicted": [str, ...]}`; rejects names that collide with a demo, non-`[a-z0-9_]{1,40}` names, oversize (>256 KiB) or non-iCE40 files (400); evicts the oldest non-demo uploads first so at most 16 uploads remain |
+  | `POST /demos/sync` | (re)writes any demo whose sha1 no longer matches a manifest kept on the board (`/bitstreams/.demos.json`) — a same-size content update is still noticed, unlike a plain size comparison → `{"synced": [str, ...], "skipped": [str, ...]}`; waits up to ~1 s for a running task before answering 409 |
+
+  Non-fpga boards get `404 {"error": "not an fpga board", "detail": ""}` on
+  all four. Other error shapes (`{"error": str, "detail": str}`): `503 board
+  not present`, `409 another task is running` (or a demo-name collision on
+  upload), `404 no such design` (including a name that could never be
+  valid — rejected before the board is asked), `502 REPL task failed`
+  (detail is the board's traceback, ANSI/non-printable bytes stripped and
+  truncated), `400` for validation failures, `500 internal error` for
+  anything unexpected (logged with a traceback; always JSON, never a bare
+  crash page).
+- `--demos-dir` (default `/usr/share/fpgas-tt/demos`) points at the demo
+  bitstream set (`index.json` + `<name>.bin` files). On fpga boards, once the
+  board is first present the daemon runs one `/demos/sync` automatically in
+  the background (retrying every 30 s on failure) so newly baked images come
+  up with the demo set already on the board.
+
+The KianV boot macro is a later phase; it too will be a task that goes
+*through* the bridge as a client — there is only ever one owner of the
+serial port.
 
 ## Install (on the Pi NFS root — done by fpgas.online-infra)
 

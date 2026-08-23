@@ -1,13 +1,24 @@
 import asyncio
+import io
 import json
+from pathlib import Path
 
 import aiohttp
 import pytest
 
-from fpgas_tt import __version__
+from fpgas_tt import __version__, designs
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.config import BoardConfig
-from fpgas_tt.server import build_parser, create_app, main
+from fpgas_tt.designs import ICE40_PREAMBLE
+from fpgas_tt.repl import ReplBusy, ReplRunner
+from fpgas_tt.server import (
+    DEMOS_SYNC_BUSY_RETRY_DELAY,
+    MULTIPART_NAME_MAX_BYTES,
+    _sync_demos_retrying_busy,
+    build_parser,
+    create_app,
+    main,
+)
 
 CFG = BoardConfig(slug="tt06", kind="asic", switch=1, port=6, hostname="pi-sw1-p6")
 
@@ -187,3 +198,275 @@ def test_log_level_is_restricted():
     assert parser.parse_args(["--log-level", "DEBUG"]).log_level == "DEBUG"
     with pytest.raises(SystemExit):
         parser.parse_args(["--log-level", "chatty"])
+
+
+DEMOS = Path(__file__).parent / "data" / "demos"
+FPGA_CFG = BoardConfig(slug="fpga-1", kind="fpga", switch=2, port=33, hostname="pi-sw2-p33")
+
+
+@pytest.fixture
+async def fpga_client(aiohttp_client, bridge, fake_repl, tmp_path):
+    # an empty demos dir: auto-sync has nothing to do and the tests control the board contents
+    empty = tmp_path / "nodemos"
+    empty.mkdir()
+    return await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=empty))
+
+
+async def test_fpga_routes_404_on_asic_board(client):
+    routes = (("GET", "/designs"), ("POST", "/designs/x/enable"), ("POST", "/bitstream"), ("POST", "/demos/sync"))
+    for method, path in routes:
+        resp = await client.request(method, path)
+        assert resp.status == 404
+        assert (await resp.json())["error"] == "not an fpga board"
+
+
+async def test_fpga_only_guard_is_checked_by_identity_not_truthiness(client, monkeypatch):
+    # aiohttp's web.Response is a MutableMapping (for per-response state) and
+    # starts with zero stored items, so len(resp) == 0. On aiohttp 3.8.4 --
+    # Debian bookworm's version, what CI's test-bookworm job runs --
+    # StreamResponse defines no __bool__, so Python falls back to __len__ and
+    # bool(resp) is False even for a genuine 404 error response; newer
+    # aiohttp added an explicit __bool__ that fixes this (so this repro only
+    # showed up under bookworm, not under whatever aiohttp is installed
+    # here). `if (err := _fpga_only(request)):` silently fell through on
+    # 3.8.4 and ran the handler body anyway -- regression: GET /designs on an
+    # asic board did a real REPL call and timed out into a 502 instead of a
+    # 404. Guard against regressing to bare truthiness on *any* aiohttp
+    # version by forcing a response whose __bool__ is hard-wired False
+    # (rather than relying on the installed aiohttp's own __len__/__bool__
+    # behaviour, which is exactly what let this slip through here before).
+    import fpgas_tt.server as server_module
+
+    class DeliberatelyFalsyResponse(server_module.web.Response):
+        def __bool__(self):
+            return False
+
+    falsy_error = DeliberatelyFalsyResponse(status=404)
+    assert not falsy_error  # sanity: this is the exact pathology being guarded against
+
+    monkeypatch.setattr(server_module, "_fpga_only", lambda request: falsy_error)
+    resp = await client.get("/designs")
+    assert resp.status == 404
+
+
+async def test_designs_list_enable_and_upload_flow(fpga_client, fake_repl):
+    (fake_repl.root / "bitstreams" / "tt_um_factory_test.bin").write_bytes(ICE40_PREAMBLE)
+    body = await (await fpga_client.get("/designs")).json()
+    assert [d["name"] for d in body["designs"]] == ["tt_um_factory_test"]
+    assert body["enabled"] is None
+
+    resp = await fpga_client.post("/designs/tt_um_factory_test/enable", json={"clock_hz": 100})
+    assert resp.status == 200
+    assert await resp.json() == {"enabled": "tt_um_factory_test", "clock_hz": 100}
+    assert (await fpga_client.post("/designs/nope/enable")).status == 404
+
+    data = ICE40_PREAMBLE + b"\x01" * 500
+    form = aiohttp.FormData()
+    form.add_field("name", "my_design")
+    form.add_field("file", data, filename="my_design.bin", content_type="application/octet-stream")
+    resp = await fpga_client.post("/bitstream", data=form)
+    assert resp.status == 201, await resp.text()
+    assert await resp.json() == {"name": "my_design", "size": len(data), "evicted": []}
+    assert (fake_repl.root / "bitstreams" / "my_design.bin").read_bytes() == data
+    names = [d["name"] for d in (await (await fpga_client.get("/designs")).json())["designs"]]
+    assert names == ["my_design", "tt_um_factory_test"]
+
+
+async def test_upload_validation_errors(fpga_client):
+    form = aiohttp.FormData()
+    form.add_field("name", "Bad Name")
+    form.add_field("file", ICE40_PREAMBLE, filename="x.bin")
+    resp = await fpga_client.post("/bitstream", data=form)
+    assert resp.status == 400
+    assert "name" in (await resp.json())["error"]
+    resp = await fpga_client.post("/bitstream", data=aiohttp.FormData())  # no fields at all
+    assert resp.status == 400
+
+
+async def test_demos_sync_route_and_auto_sync_on_start(aiohttp_client, bridge, fake_repl):
+    c = await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=DEMOS))
+    await wait_for(lambda: (fake_repl.root / "bitstreams" / "tt_um_demo_b.bin").exists(), timeout=5)
+    resp = await c.post("/demos/sync")
+    assert resp.status == 200
+    assert await resp.json() == {"synced": [], "skipped": ["tt_um_demo_a", "tt_um_demo_b"]}
+
+
+async def test_board_absent_gives_503(aiohttp_client, tmp_path):
+    bridge = Bridge(str(tmp_path / "missing"), reopen_interval=0.05)
+    await bridge.start()
+    try:
+        c = await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=tmp_path))
+        resp = await c.get("/designs")
+        assert resp.status == 503
+        assert (await resp.json())["error"] == "board not present"
+    finally:
+        await bridge.stop()
+
+
+def test_parser_demos_dir_default():
+    assert build_parser().parse_args([]).demos_dir == "/usr/share/fpgas-tt/demos"
+
+
+async def test_sync_demos_retrying_busy_succeeds_once_lock_frees(bridge, fake_repl):
+    # Simulate a concurrent task -- e.g. the startup auto-sync -- that holds
+    # the ReplRunner lock for a while, then releases it well inside the
+    # retry window. _sync_demos_retrying_busy must ride that out and succeed
+    # instead of surfacing the transient ReplBusy.
+    runner = ReplRunner(bridge)
+
+    async def hold_briefly():
+        async with runner._lock:
+            await asyncio.sleep(DEMOS_SYNC_BUSY_RETRY_DELAY * 3)
+
+    holder = asyncio.create_task(hold_briefly())
+    await wait_for(lambda: runner.busy)
+    out = await _sync_demos_retrying_busy(runner, DEMOS)
+    assert out == {"synced": ["tt_um_demo_a", "tt_um_demo_b"], "skipped": []}
+    await holder
+
+
+async def test_sync_demos_retrying_busy_gives_up_after_window(bridge, fake_repl):
+    # If the lock is still held well past the retry window, the final
+    # attempt's ReplBusy must propagate (for `_run` to turn into a 409),
+    # not hang or retry forever.
+    runner = ReplRunner(bridge)
+
+    async def hold_too_long():
+        async with runner._lock:
+            await asyncio.sleep(5)
+
+    holder = asyncio.create_task(hold_too_long())
+    await wait_for(lambda: runner.busy)
+    with pytest.raises(ReplBusy):
+        await _sync_demos_retrying_busy(runner, DEMOS)
+    holder.cancel()
+    try:
+        await holder
+    except asyncio.CancelledError:
+        pass
+
+
+async def test_auto_sync_task_survives_unexpected_exception_and_retries(
+    aiohttp_client, bridge, fake_repl, monkeypatch, caplog
+):
+    calls = {"n": 0}
+    real_sync_demos = designs.sync_demos
+
+    async def flaky(runner, demos_dir):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        return await real_sync_demos(runner, demos_dir)
+
+    monkeypatch.setattr(designs, "sync_demos", flaky)
+    monkeypatch.setattr("fpgas_tt.server.DEMO_SYNC_RETRY", 0.05)
+    with caplog.at_level("ERROR", logger="fpgas_tt.server"):
+        await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=DEMOS))
+        await wait_for(lambda: calls["n"] >= 2, timeout=5)
+    assert "unexpected exception" in caplog.text
+    assert "boom" in caplog.text
+
+
+async def test_board_returning_unparseable_output_gives_502_json_not_500_text(fpga_client, fake_repl, monkeypatch):
+    # A stray print (leftover debug output, board-side interference) before
+    # LIST_CODE's own json.dumps corrupts its stdout so json.loads can't
+    # parse it -- this must still surface as a clean 502 JSON error, not an
+    # unhandled 500 text/plain crash.
+    monkeypatch.setattr(designs, "LIST_CODE", "print('x')\n" + designs.LIST_CODE)
+    resp = await fpga_client.get("/designs")
+    assert resp.status == 502
+    assert resp.content_type == "application/json"
+    body = await resp.json()
+    assert body["error"] == "REPL task failed"
+
+
+async def test_unexpected_exception_in_task_gives_500_json_not_default_text(fpga_client, monkeypatch):
+    async def boom(runner, demos_dir):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(designs, "list_designs", boom)
+    resp = await fpga_client.get("/designs")
+    assert resp.status == 500
+    assert resp.content_type == "application/json"
+    body = await resp.json()
+    assert body["error"] == "internal error"
+    assert body["detail"] == "RuntimeError"
+
+
+async def test_replerror_detail_is_sanitized_before_it_reaches_http(fpga_client, monkeypatch):
+    from fpgas_tt.repl import ReplError
+
+    async def boom(runner, demos_dir):
+        raise ReplError("x", "\x1b[31mRED\x1b[0m\x01\x02bad\nline")
+
+    monkeypatch.setattr(designs, "list_designs", boom)
+    resp = await fpga_client.get("/designs")
+    assert resp.status == 502
+    body = await resp.json()
+    assert body["detail"] == "REDbad\nline"
+
+
+async def test_oversized_multipart_body_rejected_before_touching_repl(fpga_client, fake_repl):
+    # aiohttp can compute this request's total size upfront (every part is
+    # an in-memory bytes/BytesIO payload of known length), so this is
+    # actually caught by the Content-Length pre-check, before the parser
+    # ever runs -- 413, same as the aggregate running-total check below,
+    # since both represent the same "whole body too big" condition.
+    form = aiohttp.FormData()
+    form.add_field("name", "too_big")
+    big = ICE40_PREAMBLE + b"\x01" * (1024 * 1024)  # well over MULTIPART_MAX_BYTES
+    # io.BytesIO, not raw bytes: aiohttp warns (ResourceWarning, fatal under
+    # this repo's filterwarnings=error) about sending a large body as raw
+    # bytes and recommends exactly this.
+    form.add_field("file", io.BytesIO(big), filename="x.bin", content_type="application/octet-stream")
+    resp = await fpga_client.post("/bitstream", data=form)
+    assert resp.status == 413
+    assert fake_repl.transcript == b""  # never touched the board
+
+
+async def test_oversized_chunked_name_part_rejected_before_touching_repl(fpga_client, fake_repl):
+    # chunked=True forces no Content-Length header, so the pre-check above
+    # can't apply here regardless of body size -- and this body is well
+    # under MULTIPART_MAX_BYTES anyway, so the running-total check wouldn't
+    # catch it either: only bounding the 'name' part specifically does.
+    form = aiohttp.FormData()
+    form.add_field("name", io.BytesIO(b"x" * (MULTIPART_NAME_MAX_BYTES + 1)))
+    form.add_field("file", io.BytesIO(ICE40_PREAMBLE + b"\x01" * 100), filename="x.bin",
+                    content_type="application/octet-stream")
+    resp = await fpga_client.post("/bitstream", data=form, chunked=True)
+    assert resp.status == 400
+    assert (await resp.json())["error"] == "name too long"
+    assert fake_repl.transcript == b""  # never touched the board
+
+
+async def test_many_small_junk_multipart_parts_bounded_by_running_total(fpga_client, fake_repl):
+    # No single part is anywhere near either per-field limit, and none is
+    # named 'name' or 'file' -- only a running total across *every* part in
+    # the request catches an unbounded number of small "junk" parts holding
+    # the handler open / growing memory forever. chunked=True forces no
+    # Content-Length header (aiohttp can otherwise compute one upfront for
+    # an all-known-length body like this one, which would let the earlier
+    # pre-check catch it first instead of exercising this running total).
+    form = aiohttp.FormData()
+    junk = b"j" * 70_000
+    for i in range(6):  # 6 * 70_000 = 420_000 > MULTIPART_MAX_BYTES (327_680)
+        form.add_field(f"junk{i}", io.BytesIO(junk))
+    resp = await fpga_client.post("/bitstream", data=form, chunked=True)
+    assert resp.status == 413
+    assert fake_repl.transcript == b""  # never touched the board
+
+
+async def test_enable_rejects_non_matching_name_before_touching_repl(fpga_client, fake_repl):
+    resp = await fpga_client.post("/designs/not a valid name!/enable")
+    assert resp.status == 404
+    assert fake_repl.transcript == b""  # never touched the board
+
+
+@pytest.mark.parametrize(
+    "clock_hz",
+    [True, "100", 0, -1, 200_000_001, 3.5],
+)
+async def test_enable_rejects_invalid_clock_hz(fpga_client, clock_hz):
+    resp = await fpga_client.post("/designs/some_name/enable", json={"clock_hz": clock_hz})
+    assert resp.status == 400
+    assert "clock_hz" in (await resp.json())["error"]

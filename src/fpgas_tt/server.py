@@ -1,10 +1,33 @@
 """HTTP/WebSocket front end for the bridge, and the ``fpgas-tt`` CLI.
 
-Endpoints (phase 1):
-  GET /health   JSON status used by the site's status pill
-  WS  /serial   the bridge: binary frames <-> board bytes; text frames from the
-                server are JSON events; text frames from the client are written
-                to the board as UTF-8 bytes.
+Endpoints:
+  GET  /health                  JSON status used by the site's status pill
+  WS   /serial                  the bridge: binary frames <-> board bytes; text
+                                 frames from the server are JSON events; text
+                                 frames from the client are written to the board
+                                 as UTF-8 bytes.
+  GET  /designs                 (fpga only) list bitstreams + which is enabled
+  POST /designs/{name}/enable   (fpga only) load a bitstream, optional clock_hz
+  POST /bitstream               (fpga only) upload a bitstream (multipart: name, file)
+  POST /demos/sync              (fpga only) (re)sync the on-disk demo set onto the board;
+                                 waits up to ~1 s for a running task before answering 409
+
+The four design/bitstream/demo routes return 404
+``{"error": "not an fpga board", "detail": ""}`` on non-fpga boards, and map
+``ReplRunner``/``designs`` exceptions onto the wire contract: 503 board not
+present, 409 another task is running (or a demo-name collision on upload),
+404 no such design (including a name POSTed to /designs/{name}/enable that
+could never be valid -- rejected before the REPL is touched), 502 REPL task
+failed (with detail -- ANSI/non-printable bytes stripped, \n kept), 400
+validation errors, 500 internal error (an unexpected exception, logged with
+a traceback; always JSON, never aiohttp's default text/plain). On startup,
+fpga boards get a background task that waits for the board to be present
+and runs ``designs.sync_demos`` once, retrying every 30 s on failure (and
+surviving -- logging, then retrying -- any exception, not just REPL ones).
+``designs.sync_demos`` compares each demo's sha1 against a manifest kept on
+the board, not just its size, so a same-size content update is still
+noticed; POST /demos/sync itself rides out up to ~1 s of a task already in
+flight (e.g. that same startup sync) before answering 409.
 """
 
 from __future__ import annotations
@@ -13,14 +36,18 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import re
 import socket
 import time
+from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from fpgas_tt import __version__
+from fpgas_tt import __version__, designs
 from fpgas_tt.bridge import BoardNotPresent, Bridge
 from fpgas_tt.config import BoardConfig, discover, parse_hostname
+from fpgas_tt.designs import DEMOS_DIR_DEFAULT, DesignNotFound, ValidationError
+from fpgas_tt.repl import ReplBusy, ReplError, ReplNoBoard, ReplRunner
 from fpgas_tt.usbinfo import vid_pid_for_tty
 
 log = logging.getLogger(__name__)
@@ -34,6 +61,26 @@ LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 # ourselves; a vanished client must not hold up shutdown.
 CLOSE_REPLY_TIMEOUT = 2.0
 SHUTDOWN_TIMEOUT = 5.0
+DEMO_SYNC_RETRY = 30.0
+# POST /demos/sync riding out a startup auto-sync still in flight: bounded
+# retries * delay = ~1s worst case before it finally surfaces 409.
+DEMOS_SYNC_BUSY_RETRIES = 10
+DEMOS_SYNC_BUSY_RETRY_DELAY = 0.1
+# A little over the bitstream cap so multipart framing overhead never trips
+# this before designs.validate_bitstream gets to give a proper 400. aiohttp
+# >=3.9's request.multipart() honours Application's client_max_size on its
+# own; 3.8.4 (Debian bookworm) does not, so bitstream_upload also checks
+# Content-Length up front and bounds the 'file' part's own read below --
+# belt and braces, since either aiohttp version is in play depending on how
+# this daemon is packaged.
+MULTIPART_MAX_BYTES = designs.MAX_BITSTREAM_BYTES + 64 * 1024
+MULTIPART_CHUNK = 8192
+MULTIPART_NAME_MAX_BYTES = 256  # far more than NAME_RE's own 40-char cap ever needs
+CLOCK_HZ_MIN, CLOCK_HZ_MAX = 1, 200_000_000
+# ANSI escapes and other non-printable bytes (board output, possibly
+# corrupted by interference) must not reach an HTTP client verbatim; \n is
+# kept so multi-line detail is still readable.
+_UNSAFE_DETAIL_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|[^\x20-\x7e\n]")
 
 
 def create_app(
@@ -42,16 +89,34 @@ def create_app(
     *,
     version: str = __version__,
     config_error: str | None = None,
+    demos_dir: Path | str = DEMOS_DIR_DEFAULT,
 ) -> web.Application:
-    app = web.Application()
+    # See MULTIPART_MAX_BYTES: this only fully protects non-multipart bodies
+    # and aiohttp >=3.9's multipart parsing; bitstream_upload has its own
+    # belt-and-braces check for 3.8.4.
+    app = web.Application(client_max_size=MULTIPART_MAX_BYTES)
     app["bridge"] = bridge
     app["config"] = config
     app["version"] = version
     app["config_error"] = config_error
     app["started"] = time.monotonic()
     app["websockets"] = set()
-    app.add_routes([web.get("/health", health), web.get("/serial", serial_ws)])
+    app["demos_dir"] = Path(demos_dir)
+    app["repl"] = ReplRunner(bridge)
+    app.add_routes(
+        [
+            web.get("/health", health),
+            web.get("/serial", serial_ws),
+            web.get("/designs", designs_list),
+            web.post("/designs/{name}/enable", designs_enable),
+            web.post("/bitstream", bitstream_upload),
+            web.post("/demos/sync", demos_sync),
+        ]
+    )
     app.on_shutdown.append(close_websockets)
+    if config.kind == "fpga":
+        app.on_startup.append(start_demo_sync)
+        app.on_cleanup.append(stop_demo_sync)
     return app
 
 
@@ -62,6 +127,201 @@ async def close_websockets(app: web.Application) -> None:
             await asyncio.wait_for(
                 ws.close(code=CLOSE_GOING_AWAY, message=b"server shutdown"), CLOSE_REPLY_TIMEOUT
             )
+
+
+def _json_error(status: int, error: str, detail: str = "") -> web.Response:
+    return web.json_response({"error": error, "detail": detail}, status=status)
+
+
+def _fpga_only(request: web.Request) -> web.Response | None:
+    if request.app["config"].kind != "fpga":
+        return _json_error(404, "not an fpga board")
+    return None
+
+
+def _sanitize_detail(text: str) -> str:
+    """Strip ANSI escapes and other non-printable bytes from board output
+    before it reaches an HTTP client; keeps newlines for readability."""
+    return _UNSAFE_DETAIL_RE.sub("", text)
+
+
+async def _run(request: web.Request, coro) -> web.Response:
+    """Map task exceptions onto the wire contract."""
+    try:
+        return await coro
+    except ReplNoBoard:
+        return _json_error(503, "board not present")
+    except ReplBusy:
+        return _json_error(409, "another task is running")
+    except DesignNotFound:
+        return _json_error(404, "no such design")
+    except ReplError as exc:
+        log.warning("task failed: %s: %s", exc, exc.detail[-200:])
+        return _json_error(502, "REPL task failed", _sanitize_detail(exc.detail))
+    except Exception as exc:
+        # Belt and braces: anything that reaches here is a bug (a board
+        # output parsing gap the designs helpers didn't already catch, or
+        # something else entirely) -- it must still come back as clean JSON,
+        # not aiohttp's default 500 text/plain, and it must be logged with a
+        # traceback since nothing upstream of this point expected it.
+        log.exception("task failed with an unexpected exception")
+        return _json_error(500, "internal error", type(exc).__name__)
+
+
+async def designs_list(request: web.Request) -> web.Response:
+    if (err := _fpga_only(request)) is not None:
+        return err
+
+    async def go():
+        return web.json_response(await designs.list_designs(request.app["repl"], request.app["demos_dir"]))
+
+    return await _run(request, go())
+
+
+async def designs_enable(request: web.Request) -> web.Response:
+    if (err := _fpga_only(request)) is not None:
+        return err
+    if not designs.NAME_RE.match(request.match_info["name"]):
+        # Not a name the board could ever have -- don't even ask it (and
+        # don't let an unvalidated path segment anywhere near board code).
+        return _json_error(404, "no such design")
+    clock_hz = None
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except ValueError:
+            return _json_error(400, "body must be JSON")
+        clock_hz = body.get("clock_hz") if isinstance(body, dict) else None
+        if clock_hz is not None:
+            # bool is a subclass of int in Python -- {"clock_hz": true} must
+            # not silently become clock_hz=1.
+            if isinstance(clock_hz, bool) or not isinstance(clock_hz, int):
+                return _json_error(400, "clock_hz must be an integer")
+            if not (CLOCK_HZ_MIN <= clock_hz <= CLOCK_HZ_MAX):
+                return _json_error(400, f"clock_hz must be between {CLOCK_HZ_MIN} and {CLOCK_HZ_MAX}")
+
+    async def go():
+        return web.json_response(
+            await designs.enable_design(request.app["repl"], request.match_info["name"], clock_hz)
+        )
+
+    return await _run(request, go())
+
+
+async def bitstream_upload(request: web.Request) -> web.Response:
+    if (err := _fpga_only(request)) is not None:
+        return err
+    if not request.content_type.startswith("multipart/"):
+        return _json_error(400, "multipart form with fields 'name' and 'file' required")
+    # aiohttp 3.8.4's request.multipart() does not honour Application's
+    # client_max_size (fixed in later aiohttp) -- a declared oversized body
+    # is rejected here before the parser ever runs; a body with no (or a
+    # lying) Content-Length is instead bounded below by reading every part
+    # in chunks against a running total across the *whole* request, not
+    # just the 'name'/'file' fields -- an unbounded number of otherwise-tiny
+    # unrecognized ("junk") parts must not be able to hold the handler open
+    # or grow memory forever either.
+    if request.content_length is not None and request.content_length > MULTIPART_MAX_BYTES:
+        return _json_error(413, f"request body too large (limit {MULTIPART_MAX_BYTES} bytes)")
+    name_bytes = bytearray()
+    data = bytearray()
+    total = 0
+    reader = await request.multipart()
+    async for part in reader:
+        while chunk := await part.read_chunk(MULTIPART_CHUNK):
+            total += len(chunk)
+            if total > MULTIPART_MAX_BYTES:
+                return _json_error(413, f"request body too large (limit {MULTIPART_MAX_BYTES} bytes)")
+            if part.name == "name":
+                # BodyPartReader.read()/.text() accumulate the whole part
+                # unbounded -- same risk as 'file' below (worse: the
+                # Content-Length pre-check above doesn't cover a chunked
+                # request), so this is bounded the same way.
+                name_bytes.extend(chunk)
+                if len(name_bytes) > MULTIPART_NAME_MAX_BYTES:
+                    return _json_error(400, "name too long")
+            elif part.name == "file":
+                data.extend(chunk)
+                if len(data) > designs.MAX_BITSTREAM_BYTES:
+                    return _json_error(400, f"bitstream too large (limit {designs.MAX_BITSTREAM_BYTES} bytes)")
+            # any other part name: still counted in `total` above (and thus
+            # still bounded), just not otherwise kept.
+    name = name_bytes.decode("utf-8", "replace").strip()
+    data = bytes(data)
+    if not name or not data:
+        return _json_error(400, "fields 'name' and 'file' are required")
+    demos = designs.load_demo_index(request.app["demos_dir"])
+    try:
+        designs.validate_bitstream(name, data, set(demos))
+    except ValidationError as exc:
+        return _json_error(exc.status, str(exc))
+
+    async def go():
+        repl = request.app["repl"]
+        evicted = await designs.evict_uploads(repl, set(demos), keep=designs.MAX_UPLOADS - 1)
+        await designs.write_bitstream(repl, name, data)
+        return web.json_response({"name": name, "size": len(data), "evicted": evicted}, status=201)
+
+    return await _run(request, go())
+
+
+async def demos_sync(request: web.Request) -> web.Response:
+    if (err := _fpga_only(request)) is not None:
+        return err
+
+    async def go():
+        out = await _sync_demos_retrying_busy(request.app["repl"], request.app["demos_dir"])
+        return web.json_response(out)
+
+    return await _run(request, go())
+
+
+async def _sync_demos_retrying_busy(repl: ReplRunner, demos_dir: Path) -> dict:
+    """Sync is idempotent and often called right as the daemon boots, when
+    the startup auto-sync (``start_demo_sync``) may still be finishing its
+    own run. Rather than bounce that overlap straight to a 409 a caller has
+    to retry themselves, ride out a short, bounded window of ``ReplBusy``
+    before giving up -- the final attempt still surfaces 409 through `_run`
+    exactly as any other genuinely-busy REPL task does."""
+    for _ in range(DEMOS_SYNC_BUSY_RETRIES - 1):
+        try:
+            return await designs.sync_demos(repl, demos_dir)
+        except ReplBusy:
+            await asyncio.sleep(DEMOS_SYNC_BUSY_RETRY_DELAY)
+    return await designs.sync_demos(repl, demos_dir)  # last attempt: let ReplBusy propagate to `_run`
+
+
+async def start_demo_sync(app: web.Application) -> None:
+    async def loop() -> None:
+        bridge: Bridge = app["bridge"]
+        while True:
+            if bridge.present:
+                try:
+                    out = await designs.sync_demos(app["repl"], app["demos_dir"])
+                    log.info("demos: synced=%s skipped=%s", out["synced"], out["skipped"])
+                    return
+                except ReplError as exc:
+                    log.warning("demos: sync failed (%s); retrying in %ss", exc, DEMO_SYNC_RETRY)
+                    await asyncio.sleep(DEMO_SYNC_RETRY)
+                    continue
+                except Exception:
+                    # Must never die silently: an unexpected bug here would
+                    # otherwise leave the board without demos forever, with
+                    # nothing in the logs pointing at why.
+                    log.exception("demos: sync task raised an unexpected exception; retrying in %ss", DEMO_SYNC_RETRY)
+                    await asyncio.sleep(DEMO_SYNC_RETRY)
+                    continue
+            await asyncio.sleep(0.2)
+
+    app["demo_sync_task"] = asyncio.create_task(loop(), name="fpgas-tt-demo-sync")
+
+
+async def stop_demo_sync(app: web.Application) -> None:
+    task = app.get("demo_sync_task")
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 async def health(request: web.Request) -> web.Response:
@@ -170,6 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--baudrate", type=int, default=115200)
     p.add_argument("--log-level", default="INFO", choices=list(LOG_LEVELS))
+    p.add_argument("--demos-dir", default=str(DEMOS_DIR_DEFAULT), help="directory of demo bitstreams + index.json")
     return p
 
 
@@ -193,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
              args.device)
 
     bridge = Bridge(args.device, baudrate=args.baudrate)
-    app = create_app(bridge, config, config_error=config_error)
+    app = create_app(bridge, config, config_error=config_error, demos_dir=args.demos_dir)
 
     async def on_startup(_app: web.Application) -> None:
         await bridge.start()
