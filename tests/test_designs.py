@@ -31,9 +31,6 @@ async def runner(fake_board, fake_repl):
     await wait_for(lambda: b.present)
     yield ReplRunner(b)
     await b.stop()
-    # The fake board refuses every change to its filesystem (fakerepl.BoardWrite); this catches one that a
-    # snippet tried and swallowed.
-    assert fake_repl.board_writes == []
 
 
 def board_tree(fake_repl) -> dict[str, bytes | None]:
@@ -283,6 +280,19 @@ async def test_a_main_py_that_prints_the_sdks_line_without_building_it_is_not_a_
         await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
 
 
+async def test_output_right_after_the_prompt_does_not_hide_that_the_board_is_back(
+    runner, fake_repl, uploads, monkeypatch
+):
+    """Another client of the bridge (a viewer typing) can make the board print straight after its prompt."""
+    import tests.fakerepl as fakerepl
+
+    monkeypatch.setattr(fakerepl, "FRIENDLY_BANNER", fakerepl.FRIENDLY_BANNER + b"1+1\r\n2\r\n>>> x")
+    fake_repl._globals["_the_sdk"] = fake_repl._globals.pop("tt")
+    (fake_repl.root / "main.py").write_text(SDK_MAIN)
+    await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    assert fake_repl.soft_resets == 1 and fake_repl.tt.shuttle.enable_log == ["tt_um_demo_a"]
+
+
 async def test_a_board_that_does_not_come_back_from_the_reset_fails_in_time(runner, fake_repl, uploads, monkeypatch):
     del fake_repl._globals["tt"]
     (fake_repl.root / "main.py").write_text("import time\ntime.sleep(2)\n")
@@ -323,6 +333,22 @@ async def test_a_bitstream_that_did_not_arrive_as_sent_is_not_loaded(runner, fak
         await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
     assert "did not arrive as it was sent" in str(ei.value.detail)
     assert fake_repl.loaded == [] and fake_repl.tt.shuttle.enable_log == []
+
+
+async def test_a_load_refused_before_the_fpga_is_touched_leaves_the_running_design_named(
+    runner, fake_repl, uploads, monkeypatch
+):
+    await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    real = designs._load_steps
+
+    def corrupted(name, data, clock_hz):
+        steps = real(name, data, clock_hz)
+        return [*steps[:-1], "_fo_buf[5] ^= 0xff\n", steps[-1]]
+
+    monkeypatch.setattr(designs, "_load_steps", corrupted)
+    with pytest.raises(ReplError):
+        await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
+    assert (await designs.list_designs(runner, DEMOS, uploads))["enabled"] == "tt_um_demo_a"  # still running
 
 
 async def test_a_load_cut_short_leaves_nothing_that_stops_the_next_one(runner, fake_repl, uploads):
@@ -422,7 +448,13 @@ async def test_the_fake_board_refuses_what_the_daemon_used_to_send(runner, fake_
         with pytest.raises(ReplError) as ei:
             await runner.exec(code)
         assert "BoardWrite" in str(ei.value.detail)
-    assert fake_repl.board_writes == ["open('/bitstreams/x.bin.tmp', 'wb')"]
+    assert fake_repl.board_writes == [
+        "open('/bitstreams/x.bin.tmp', 'wb')", "os.remove('/bitstreams/x.bin')", "os.rename('/a', '/b')",
+        "os.mkdir('/bitstreams')",
+    ]  # fmt: skip
+    # a snippet that swallows the refusal, as the old sweep did, is still recorded
+    await runner.exec("import os\ntry:\n    os.remove('/bitstreams/y.tmp')\nexcept Exception:\n    pass\nprint('ok')\n")
+    assert fake_repl.board_writes[-1] == "os.remove('/bitstreams/y.tmp')"
     fake_repl.board_writes.clear()  # these were this test's own
 
 

@@ -210,8 +210,10 @@ print('buffer')
 # The SDK's loader reads its bitstream with `open(path, 'rb')` and `.read(128)`. For the one load, the loader
 # module's own `open` is this reader over the buffer in memory; it is taken away again whatever happens. The
 # buffer is checked against the Pi's SHA-256 before anything is loaded. The SDK names the design as enabled
-# before it has transferred it, and its loader prints an OSError instead of raising it: so a load that failed,
-# or did not read every byte, leaves `tt.shuttle.enabled` as None, never the design's name.
+# before it has transferred it, and its loader prints an OSError instead of raising it: so a load that failed
+# once the FPGA was touched, or did not read every byte, leaves `tt.shuttle.enabled` as None, never the design's
+# name. A load refused before that (an incomplete or damaged buffer) leaves the running design, and its name,
+# as they were.
 LOAD_CODE = """\
 import gc, binascii, hashlib
 import ttboard.fpga.fabricfoxv2 as _fo_loader
@@ -233,6 +235,7 @@ try:
 except AttributeError:
     pass
 _fo_ok = False
+_fo_touched = False
 try:
     if _fo_n != __SIZE__:
         raise ValueError('bitstream incomplete: %d of __SIZE__ bytes' % _fo_n)
@@ -240,6 +243,7 @@ try:
         raise ValueError('the bitstream did not arrive as it was sent')
     _fo_reader = _fo_Reader(_fo_buf)
     _fo_loader.open = lambda path, mode='rb': _fo_reader
+    _fo_touched = True
     tt.shuttle.enable(_fo_BitStream(tt.shuttle, __PATH__, __NAME__, -1))
     if _fo_reader.at != __SIZE__:
         raise ValueError('the loader read %d of __SIZE__ bytes' % _fo_reader.at)
@@ -249,11 +253,11 @@ finally:
         del _fo_loader.open
     except AttributeError:
         pass
-    if not _fo_ok:
-        tt.shuttle.enabled = None
     _fo_buf = None
     _fo_reader = None
     gc.collect()
+    if _fo_touched and not _fo_ok:
+        tt.shuttle.enabled = None
 __CLOCK__print('enabled')
 """
 

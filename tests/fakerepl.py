@@ -38,6 +38,11 @@ class _FakeOs:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.writes: list[str] = []  # every attempt, kept: a snippet could catch the exception
+
+    def _refuse(self, what: str):
+        self.writes.append(what)
+        raise BoardWrite(what)
 
     def _p(self, path: str) -> Path:
         return self.root / path.lstrip("/")
@@ -51,13 +56,13 @@ class _FakeOs:
         return (st.st_mode, 0, 0, 0, 0, 0, st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime))
 
     def remove(self, path: str):
-        raise BoardWrite(f"os.remove({path!r})")
+        self._refuse(f"os.remove({path!r})")
 
     def rename(self, src: str, dst: str):
-        raise BoardWrite(f"os.rename({src!r}, {dst!r})")
+        self._refuse(f"os.rename({src!r}, {dst!r})")
 
     def mkdir(self, path: str):
-        raise BoardWrite(f"os.mkdir({path!r})")
+        self._refuse(f"os.mkdir({path!r})")
 
     unlink = remove
     rmdir = remove
@@ -186,11 +191,10 @@ class FakeRepl:
 
         def _open(path, mode="r", *a, **k):  # MicroPython's open() is relative to its own FS root
             if mode not in ("r", "rb", "rt"):
-                self.board_writes.append(f"open({path!r}, {mode!r})")
-                raise BoardWrite(f"open({path!r}, {mode!r})")
+                self.fos._refuse(f"open({path!r}, {mode!r})")
             return builtins.open(self.fos._p(path), mode, *a, **k)
 
-        self.board_writes: list[str] = []  # also kept here: a snippet could catch the exception
+        self.board_writes = self.fos.writes
 
         # The SDK's modules a snippet may import. The loader module has no `open` of its own: it finds the
         # board's through its builtins, as on the board.

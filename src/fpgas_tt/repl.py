@@ -153,8 +153,9 @@ class ReplRunner:
                             raise ReplNoBoard("board not present")
                         seen += data
                         after = seen.rpartition(SOFT_REBOOT)[2] if SOFT_REBOOT in seen else b""
-                        # back at the prompt: the friendly prompt on a line of its own, with nothing after it
-                        if after.replace(b"\r", b"").endswith(b"\n" + FRIENDLY_PROMPT):
+                        # back at the prompt: the friendly prompt at the start of a line. Not "at the end of
+                        # what was read": another client of the bridge may make the board print right after it.
+                        if b"\n" + FRIENDLY_PROMPT in after.replace(b"\r", b""):
                             return after.decode("utf-8", "replace")
             except TimeoutError as exc:
                 what = "come back to its prompt" if SOFT_REBOOT in seen else "soft-reset"
