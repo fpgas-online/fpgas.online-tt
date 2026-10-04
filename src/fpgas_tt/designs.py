@@ -11,7 +11,8 @@ Board-side facts (TT SDK 3.1.0, FPGA breakout): ``tt.shuttle.enable(design)`` re
 ``tt.shuttle.enabled`` and calls ``ttboard.fpga.fabricfoxv2.spi_transferPIO(design.file)``, which opens that
 path with the module's ``open`` and reads 128 bytes at a time; ``tt.clock_project_PWM(hz)`` sets the clock. The
 SDK's ``tt`` object exists only after the board's own main.py has run: a raw-REPL soft reset (mpremote, the
-boot check) leaves the board without it, so loading first runs main.py when ``tt`` is missing.
+boot check) leaves the board without it. Loading then does what the Commander does when the SDK does not
+answer: it soft-resets the board from the friendly REPL, which runs main.py.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from fpgas_tt.repl import ReplError, ReplRunner
@@ -185,18 +187,12 @@ ENABLED_CODE = (
     "print(json.dumps({'enabled': _fo_en.name if _fo_en else None}))\n"
 )
 
-# Run first when loading: the SDK's `tt` object, built by the board's own main.py when it is not there (or is
-# the None a cut-short start left). That is the SDK's normal start, read from the board and run as it is;
-# main.py's own output is not the answer.
-ENSURE_SDK_CODE = (
-    "if globals().get('tt') is None:\n"
-    "    with open('main.py') as _fo_f:\n"
-    "        _fo_main = _fo_f.read()\n"
-    "    exec(_fo_main)\n"
-    "    _fo_main = None\n"
-    "tt.shuttle\n"
-    "print('sdk')\n"
-)
+# Asked first when loading: is the SDK's `tt` object there?
+SDK_CODE = "print('sdk' if globals().get('tt') is not None else 'nosdk')\n"
+# The SDK's last boot line (its main.py prints it once the board object is built).
+SDK_STARTED = "tt.sdk_version="
+# Starting the SDK: the board's own main.py takes about 2 s on a v3 demo board.
+SDK_START_TIMEOUT = 10.0
 
 # Before the buffer is made: whatever an earlier load that was cut short left behind is let go first, so two
 # buffers never have to fit in the board's memory at once.
@@ -293,6 +289,18 @@ def _read_design(demos_dir: Path, uploads_dir: Path, name: str) -> bytes:
         raise DesignNotFound(name) from exc
 
 
+async def ensure_sdk(runner: ReplRunner) -> None:
+    """Have the board's SDK running, the way the Commander does it (Tim, 2026-10-05, answer tt-07: "DO the same
+    thing the commander app does"): ask whether the SDK is there, and only if it is not, soft-reset the board
+    from the friendly REPL (Ctrl-C twice, Ctrl-B, Ctrl-D), which runs the board's own boot.py and main.py.
+    Raises ReplError when main.py does not start the SDK."""
+    if (await runner.exec(SDK_CODE)).strip() == "sdk":
+        return
+    said = await runner.soft_reset(timeout=SDK_START_TIMEOUT)
+    if SDK_STARTED not in said or (await runner.exec(SDK_CODE)).strip() != "sdk":
+        raise ReplError("the board's main.py did not start the Tiny Tapeout SDK", said)
+
+
 async def list_designs(runner: ReplRunner, demos_dir: Path, uploads_dir: Path) -> dict:
     out = _parse_json(await runner.exec(ENABLED_CODE))
     # The Pi's root is on NFS: its files are read off the event loop, which also serves the serial bridge.
@@ -304,11 +312,13 @@ async def enable_design(
 ) -> dict:
     # design_file refuses a name the Pi could never have before anything goes near the board.
     data = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name)
-    # One REPL session, so nobody else's bytes come between the SDK check, the buffer and the load. timeout
-    # (per-read) stays 30s -- the SPI load takes a few seconds and any single read waiting on it is normal;
-    # overall is intentionally tighter (see ENABLE_OVERALL_TIMEOUT).
-    steps = [ENSURE_SDK_CODE, *_load_steps(name, data, clock_hz)]
-    outs = await runner.exec_steps(steps, timeout=30.0, overall=ENABLE_OVERALL_TIMEOUT)
+    started = time.monotonic()
+    await ensure_sdk(runner)
+    # timeout (per-read) stays 30s -- the SPI load takes a few seconds and any single read waiting on it is
+    # normal; overall is intentionally tighter (see ENABLE_OVERALL_TIMEOUT), and what starting the SDK took
+    # comes out of it.
+    overall = max(5.0, ENABLE_OVERALL_TIMEOUT - (time.monotonic() - started))
+    outs = await runner.exec_steps(_load_steps(name, data, clock_hz), timeout=30.0, overall=overall)
     if outs[-1].strip().splitlines()[-1:] != ["enabled"]:
         raise ReplError("the board did not confirm the load", outs[-1])
     return {"enabled": name, "clock_hz": clock_hz}

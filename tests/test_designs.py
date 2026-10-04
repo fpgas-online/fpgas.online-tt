@@ -243,25 +243,52 @@ async def test_enable_design_applies_explicit_zero_clock_hz(runner, fake_repl, u
     assert fake_repl.tt.clock_log == [0]
 
 
-async def test_enable_design_starts_the_sdk_with_the_boards_own_main_py_when_it_is_not_running(
-    runner, fake_repl, uploads
-):
-    """After a raw-REPL soft reset (mpremote, the boot check) there is no `tt` until main.py has run."""
+SDK_MAIN = "print('BOOT: Tiny Tapeout SDK')\ntt = _the_sdk\nprint('tt.sdk_version=3.1.0')\n"
+
+
+async def test_enable_design_starts_a_missing_sdk_the_way_the_commander_does(runner, fake_repl, uploads):
+    """After a raw-REPL soft reset (mpremote, the boot check) there is no `tt`. The Commander then soft-resets
+    the board from the friendly REPL, which runs the board's own main.py (Tim, tt-07: do the same)."""
     fake_repl._globals["_the_sdk"] = fake_repl._globals.pop("tt")
-    (fake_repl.root / "main.py").write_text("print('BOOT: Tiny Tapeout SDK')\ntt = _the_sdk\n")
+    (fake_repl.root / "main.py").write_text(SDK_MAIN)
     before = board_tree(fake_repl)
     await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    assert fake_repl.soft_resets == 1
+    assert b"\x03\x03\x02\x04" in bytes(fake_repl.transcript)  # the Commander's own bytes, in its order
     assert fake_repl._globals["tt"] is fake_repl.tt and fake_repl.tt.shuttle.enable_log == ["tt_um_demo_a"]
     assert board_tree(fake_repl) == before
+
+
+async def test_a_running_sdk_is_not_reset(runner, fake_repl, uploads):
+    (fake_repl.root / "main.py").write_text(SDK_MAIN)
+    await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    assert fake_repl.soft_resets == 0
 
 
 async def test_enable_design_fails_loudly_when_the_boards_main_py_does_not_start_the_sdk(runner, fake_repl, uploads):
     del fake_repl._globals["tt"]
     (fake_repl.root / "main.py").write_text("print('TT FPGA board ready')\n")  # the old test wrapper's no-op
-    with pytest.raises(ReplError) as ei:
+    with pytest.raises(ReplError, match="main.py did not start the Tiny Tapeout SDK") as ei:
         await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
-    assert "NameError" in str(ei.value.detail)
-    assert fake_repl.loaded == []
+    assert "TT FPGA board ready" in str(ei.value.detail)
+    assert fake_repl.soft_resets == 1 and fake_repl.loaded == []
+
+
+async def test_a_main_py_that_prints_the_sdks_line_without_building_it_is_not_a_started_sdk(
+    runner, fake_repl, uploads
+):
+    del fake_repl._globals["tt"]
+    (fake_repl.root / "main.py").write_text("print('tt.sdk_version=3.1.0')\n")
+    with pytest.raises(ReplError, match="did not start the Tiny Tapeout SDK"):
+        await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+
+
+async def test_a_board_that_does_not_come_back_from_the_reset_fails_in_time(runner, fake_repl, uploads, monkeypatch):
+    del fake_repl._globals["tt"]
+    (fake_repl.root / "main.py").write_text("import time\ntime.sleep(2)\n")
+    monkeypatch.setattr(designs, "SDK_START_TIMEOUT", 0.3)
+    with pytest.raises(ReplError, match="did not come back to its prompt in time|did not soft-reset in time"):
+        await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
 
 
 async def test_enable_design_fails_when_the_sdks_loader_did_not_read_the_whole_bitstream(
@@ -323,9 +350,10 @@ async def test_a_board_whose_sdk_start_was_cut_short_is_started_again(runner, fa
     """The SDK's main.py sets `tt = None` before it builds the board: interrupted there, `tt` exists and is None."""
     fake_repl._globals["_the_sdk"] = fake_repl._globals["tt"]
     fake_repl._globals["tt"] = None
-    (fake_repl.root / "main.py").write_text("tt = None\ntt = _the_sdk\n")
+    (fake_repl.root / "main.py").write_text(SDK_MAIN)
     assert (await designs.list_designs(runner, DEMOS, uploads))["enabled"] is None
     await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    assert fake_repl.soft_resets == 1
     assert fake_repl._globals["tt"] is fake_repl.tt and fake_repl.tt.shuttle.enable_log == ["tt_um_demo_a"]
 
 
@@ -382,7 +410,7 @@ def test_no_text_in_the_daemon_reads_like_a_board_write(path):
 
 
 def test_the_steps_of_a_load_as_sent_do_not_read_like_a_board_write():
-    for step in [designs.ENSURE_SDK_CODE, designs.ENABLED_CODE, *designs._load_steps("my_upload", PRE * 600, 1000)]:
+    for step in [designs.SDK_CODE, designs.ENABLED_CODE, *designs._load_steps("my_upload", PRE * 600, 1000)]:
         assert not BOARD_WRITE.search(step), BOARD_WRITE.search(step)
 
 

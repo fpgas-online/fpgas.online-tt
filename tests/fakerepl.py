@@ -182,6 +182,7 @@ class FakeRepl:
         self.fos = _FakeOs(self.root)
         (self.root / "bitstreams").mkdir(exist_ok=True)
         self._task: asyncio.Task | None = None
+        self.soft_resets = 0
 
         def _open(path, mode="r", *a, **k):  # MicroPython's open() is relative to its own FS root
             if mode not in ("r", "rb", "rt"):
@@ -272,6 +273,14 @@ class FakeRepl:
                         raw = True
                         await self._write(self.raw_preamble + RAW_BANNER + self.echo_junk)
                         continue
+                    if b"\x04" in buf:
+                        # Ctrl-D at the friendly prompt: a soft reset. The interpreter starts afresh (its
+                        # globals are gone) and runs the board's main.py, whose output goes to the port.
+                        buf = buf.split(b"\x04", 1)[1]
+                        self.soft_resets += 1
+                        out, err = self.soft_reset()
+                        await self._write(b"\r\nMPY: soft reboot\r\n" + out.encode() + err.encode() + FRIENDLY_BANNER)
+                        continue
                     buf = b""  # friendly mode: swallow (Ctrl-C, newlines, ...)
                     break
                 # raw mode
@@ -290,6 +299,15 @@ class FakeRepl:
                 code = code.replace(b"\r", b"")
                 out, err = self._run(code.decode("utf-8", "replace"))
                 await self._write(b"OK" + out.encode() + b"\x04" + err.encode() + b"\x04>")
+
+    def soft_reset(self) -> tuple[str, str]:
+        """A fresh interpreter: only what the firmware provides survives (here: the sandboxed os and open, and
+        `_the_sdk`, a test's stand-in for what the SDK's main.py builds). Then main.py, if the board has one."""
+        kept = {k: v for k, v in self._globals.items() if k in ("os", "open", "__builtins__", "__name__", "_the_sdk")}
+        self._globals.clear()
+        self._globals.update(kept)
+        main = self.root / "main.py"
+        return self._run(main.read_text()) if main.exists() else ("", "")
 
     def _run(self, code: str) -> tuple[str, str]:
         # A real board keeps one running interpreter: globals set by one
