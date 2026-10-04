@@ -10,11 +10,8 @@ from fpgas_tt import __version__, designs
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.config import BoardConfig
 from fpgas_tt.designs import ICE40_PREAMBLE
-from fpgas_tt.repl import ReplBusy, ReplRunner
 from fpgas_tt.server import (
-    DEMOS_SYNC_BUSY_RETRY_DELAY,
     MULTIPART_NAME_MAX_BYTES,
-    _sync_demos_retrying_busy,
     build_parser,
     create_app,
     main,
@@ -206,14 +203,12 @@ FPGA_CFG = BoardConfig(slug="fpga-1", kind="fpga", switch=2, port=33, hostname="
 
 @pytest.fixture
 async def fpga_client(aiohttp_client, bridge, fake_repl, tmp_path):
-    # an empty demos dir: auto-sync has nothing to do and the tests control the board contents
-    empty = tmp_path / "nodemos"
-    empty.mkdir()
-    return await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=empty))
+    # the designs are the Pi's: the packaged demos, and uploads in a directory of this test's own
+    return await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=DEMOS, uploads_dir=tmp_path / "pi-uploads"))
 
 
 async def test_fpga_routes_404_on_asic_board(client):
-    routes = (("GET", "/designs"), ("POST", "/designs/x/enable"), ("POST", "/bitstream"), ("POST", "/demos/sync"))
+    routes = (("GET", "/designs"), ("POST", "/designs/x/enable"), ("POST", "/bitstream"))
     for method, path in routes:
         resp = await client.request(method, path)
         assert resp.status == 404
@@ -249,27 +244,68 @@ async def test_fpga_only_guard_is_checked_by_identity_not_truthiness(client, mon
     assert resp.status == 404
 
 
-async def test_designs_list_enable_and_upload_flow(fpga_client, fake_repl):
-    (fake_repl.root / "bitstreams" / "tt_um_factory_test.bin").write_bytes(ICE40_PREAMBLE)
+def board_tree(fake_repl):
+    root = fake_repl.root
+    return {str(f.relative_to(root)): (f.read_bytes() if f.is_file() else None) for f in sorted(root.rglob("*"))}
+
+
+async def test_designs_list_enable_and_upload_flow_never_changes_a_file_on_the_board(fpga_client, fake_repl, tmp_path):
+    (fake_repl.root / "bitstreams" / "custom.bin").write_bytes(b"left by an older loader")
+    before = board_tree(fake_repl)
     body = await (await fpga_client.get("/designs")).json()
-    assert [d["name"] for d in body["designs"]] == ["tt_um_factory_test"]
+    assert [d["name"] for d in body["designs"]] == ["tt_um_demo_a", "tt_um_demo_b"]
     assert body["enabled"] is None
 
-    resp = await fpga_client.post("/designs/tt_um_factory_test/enable", json={"clock_hz": 100})
+    resp = await fpga_client.post("/designs/tt_um_demo_a/enable", json={"clock_hz": 100})
     assert resp.status == 200
-    assert await resp.json() == {"enabled": "tt_um_factory_test", "clock_hz": 100}
+    assert await resp.json() == {"enabled": "tt_um_demo_a", "clock_hz": 100}
     assert (await fpga_client.post("/designs/nope/enable")).status == 404
+    assert (await fpga_client.post("/designs/custom/enable")).status == 404  # on the board only: not a design
 
-    data = ICE40_PREAMBLE + b"\x01" * 500
+    data = ICE40_PREAMBLE + b"\x01" * 5000
     form = aiohttp.FormData()
     form.add_field("name", "my_design")
     form.add_field("file", data, filename="my_design.bin", content_type="application/octet-stream")
     resp = await fpga_client.post("/bitstream", data=form)
     assert resp.status == 201, await resp.text()
     assert await resp.json() == {"name": "my_design", "size": len(data), "evicted": []}
-    assert (fake_repl.root / "bitstreams" / "my_design.bin").read_bytes() == data
-    names = [d["name"] for d in (await (await fpga_client.get("/designs")).json())["designs"]]
-    assert names == ["my_design", "tt_um_factory_test"]
+    assert (tmp_path / "pi-uploads" / "my_design.bin").read_bytes() == data  # kept on the Pi
+    body = await (await fpga_client.get("/designs")).json()
+    assert [d["name"] for d in body["designs"]] == ["my_design", "tt_um_demo_a", "tt_um_demo_b"]
+    assert body["enabled"] == "tt_um_demo_a"
+
+    resp = await fpga_client.post("/designs/my_design/enable")
+    assert resp.status == 200, await resp.text()
+    assert fake_repl.loaded[-1] == ("pi:my_design.bin", data)  # the SDK's loader got the upload's bytes
+    assert (await (await fpga_client.get("/designs")).json())["enabled"] == "my_design"
+    assert board_tree(fake_repl) == before
+
+
+async def test_starting_the_daemon_sends_nothing_to_the_board(fpga_client, fake_repl):
+    """It used to copy every demo to the board's /bitstreams when it started."""
+    await asyncio.sleep(0.3)
+    assert fake_repl.transcript == b"" and board_tree(fake_repl) == {"bitstreams": None}
+
+
+async def test_an_upload_does_not_touch_the_board(fpga_client, fake_repl):
+    form = aiohttp.FormData()
+    form.add_field("name", "my_design")
+    form.add_field("file", ICE40_PREAMBLE + b"\x02" * 100, filename="my_design.bin")
+    assert (await fpga_client.post("/bitstream", data=form)).status == 201
+    assert fake_repl.transcript == b""
+
+
+async def test_an_upload_that_cannot_be_kept_is_a_json_500(fpga_client, monkeypatch):
+    def no_room(uploads_dir, name, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(designs, "store_upload", no_room)
+    form = aiohttp.FormData()
+    form.add_field("name", "my_design")
+    form.add_field("file", ICE40_PREAMBLE + b"\x02" * 100, filename="my_design.bin")
+    resp = await fpga_client.post("/bitstream", data=form)
+    assert resp.status == 500 and resp.content_type == "application/json"
+    assert await resp.json() == {"error": "the upload could not be kept on the Pi", "detail": "OSError"}
 
 
 async def test_upload_validation_errors(fpga_client):
@@ -283,19 +319,15 @@ async def test_upload_validation_errors(fpga_client):
     assert resp.status == 400
 
 
-async def test_demos_sync_route_and_auto_sync_on_start(aiohttp_client, bridge, fake_repl):
-    c = await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=DEMOS))
-    await wait_for(lambda: (fake_repl.root / "bitstreams" / "tt_um_demo_b.bin").exists(), timeout=5)
-    resp = await c.post("/demos/sync")
-    assert resp.status == 200
-    assert await resp.json() == {"synced": [], "skipped": ["tt_um_demo_a", "tt_um_demo_b"]}
+async def test_the_demo_sync_route_is_gone(fpga_client):
+    assert (await fpga_client.post("/demos/sync")).status in (404, 405)
 
 
 async def test_board_absent_gives_503(aiohttp_client, tmp_path):
     bridge = Bridge(str(tmp_path / "missing"), reopen_interval=0.05)
     await bridge.start()
     try:
-        c = await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=tmp_path))
+        c = await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=tmp_path, uploads_dir=tmp_path / "up"))
         resp = await c.get("/designs")
         assert resp.status == 503
         assert (await resp.json())["error"] == "board not present"
@@ -303,76 +335,18 @@ async def test_board_absent_gives_503(aiohttp_client, tmp_path):
         await bridge.stop()
 
 
-def test_parser_demos_dir_default():
-    assert build_parser().parse_args([]).demos_dir == "/usr/share/fpgas-tt/demos"
-
-
-async def test_sync_demos_retrying_busy_succeeds_once_lock_frees(bridge, fake_repl):
-    # Simulate a concurrent task -- e.g. the startup auto-sync -- that holds
-    # the ReplRunner lock for a while, then releases it well inside the
-    # retry window. _sync_demos_retrying_busy must ride that out and succeed
-    # instead of surfacing the transient ReplBusy.
-    runner = ReplRunner(bridge)
-
-    async def hold_briefly():
-        async with runner._lock:
-            await asyncio.sleep(DEMOS_SYNC_BUSY_RETRY_DELAY * 3)
-
-    holder = asyncio.create_task(hold_briefly())
-    await wait_for(lambda: runner.busy)
-    out = await _sync_demos_retrying_busy(runner, DEMOS)
-    assert out == {"synced": ["tt_um_demo_a", "tt_um_demo_b"], "skipped": []}
-    await holder
-
-
-async def test_sync_demos_retrying_busy_gives_up_after_window(bridge, fake_repl):
-    # If the lock is still held well past the retry window, the final
-    # attempt's ReplBusy must propagate (for `_run` to turn into a 409),
-    # not hang or retry forever.
-    runner = ReplRunner(bridge)
-
-    async def hold_too_long():
-        async with runner._lock:
-            await asyncio.sleep(5)
-
-    holder = asyncio.create_task(hold_too_long())
-    await wait_for(lambda: runner.busy)
-    with pytest.raises(ReplBusy):
-        await _sync_demos_retrying_busy(runner, DEMOS)
-    holder.cancel()
-    try:
-        await holder
-    except asyncio.CancelledError:
-        pass
-
-
-async def test_auto_sync_task_survives_unexpected_exception_and_retries(
-    aiohttp_client, bridge, fake_repl, monkeypatch, caplog
-):
-    calls = {"n": 0}
-    real_sync_demos = designs.sync_demos
-
-    async def flaky(runner, demos_dir):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("boom")
-        return await real_sync_demos(runner, demos_dir)
-
-    monkeypatch.setattr(designs, "sync_demos", flaky)
-    monkeypatch.setattr("fpgas_tt.server.DEMO_SYNC_RETRY", 0.05)
-    with caplog.at_level("ERROR", logger="fpgas_tt.server"):
-        await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=DEMOS))
-        await wait_for(lambda: calls["n"] >= 2, timeout=5)
-    assert "unexpected exception" in caplog.text
-    assert "boom" in caplog.text
+def test_parser_demos_and_uploads_dir_defaults():
+    args = build_parser().parse_args([])
+    assert args.demos_dir == "/usr/share/fpgas-tt/demos"
+    assert args.uploads_dir == "/var/lib/fpgas-tt/uploads"  # the service's StateDirectory: on the Pi
 
 
 async def test_board_returning_unparseable_output_gives_502_json_not_500_text(fpga_client, fake_repl, monkeypatch):
     # A stray print (leftover debug output, board-side interference) before
-    # LIST_CODE's own json.dumps corrupts its stdout so json.loads can't
+    # ENABLED_CODE's own json.dumps corrupts its stdout so json.loads can't
     # parse it -- this must still surface as a clean 502 JSON error, not an
     # unhandled 500 text/plain crash.
-    monkeypatch.setattr(designs, "LIST_CODE", "print('x')\n" + designs.LIST_CODE)
+    monkeypatch.setattr(designs, "ENABLED_CODE", "print('x')\n" + designs.ENABLED_CODE)
     resp = await fpga_client.get("/designs")
     assert resp.status == 502
     assert resp.content_type == "application/json"
@@ -381,7 +355,7 @@ async def test_board_returning_unparseable_output_gives_502_json_not_500_text(fp
 
 
 async def test_unexpected_exception_in_task_gives_500_json_not_default_text(fpga_client, monkeypatch):
-    async def boom(runner, demos_dir):
+    async def boom(runner, demos_dir, uploads_dir):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(designs, "list_designs", boom)
@@ -396,7 +370,7 @@ async def test_unexpected_exception_in_task_gives_500_json_not_default_text(fpga
 async def test_replerror_detail_is_sanitized_before_it_reaches_http(fpga_client, monkeypatch):
     from fpgas_tt.repl import ReplError
 
-    async def boom(runner, demos_dir):
+    async def boom(runner, demos_dir, uploads_dir):
         raise ReplError("x", "\x1b[31mRED\x1b[0m\x01\x02bad\nline")
 
     monkeypatch.setattr(designs, "list_designs", boom)

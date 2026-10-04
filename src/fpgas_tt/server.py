@@ -6,13 +6,14 @@ Endpoints:
                                  frames from the server are JSON events; text
                                  frames from the client are written to the board
                                  as UTF-8 bytes.
-  GET  /designs                 (fpga only) list bitstreams + which is enabled
-  POST /designs/{name}/enable   (fpga only) load a bitstream, optional clock_hz
+  GET  /designs                 (fpga only) list the designs on this Pi + which is loaded
+  POST /designs/{name}/enable   (fpga only) load a design into the FPGA, optional clock_hz
   POST /bitstream               (fpga only) upload a bitstream (multipart: name, file)
-  POST /demos/sync              (fpga only) (re)sync the on-disk demo set onto the board;
-                                 waits up to ~1 s for a running task before answering 409
 
-The four design/bitstream/demo routes return 404
+Nothing here writes to the demo board's filesystem: designs are files on the Pi (the packaged demos, and
+uploads in --uploads-dir), and loading one streams it into the FPGA through the board's memory (designs.py).
+
+The three design/bitstream routes return 404
 ``{"error": "not an fpga board", "detail": ""}`` on non-fpga boards, and map
 ``ReplRunner``/``designs`` exceptions onto the wire contract: 503 board not
 present, 409 another task is running (or a demo-name collision on upload),
@@ -20,14 +21,7 @@ present, 409 another task is running (or a demo-name collision on upload),
 could never be valid -- rejected before the REPL is touched), 502 REPL task
 failed (with detail -- ANSI/non-printable bytes stripped, \n kept), 400
 validation errors, 500 internal error (an unexpected exception, logged with
-a traceback; always JSON, never aiohttp's default text/plain). On startup,
-fpga boards get a background task that waits for the board to be present
-and runs ``designs.sync_demos`` once, retrying every 30 s on failure (and
-surviving -- logging, then retrying -- any exception, not just REPL ones).
-``designs.sync_demos`` compares each demo's sha1 against a manifest kept on
-the board, not just its size, so a same-size content update is still
-noticed; POST /demos/sync itself rides out up to ~1 s of a task already in
-flight (e.g. that same startup sync) before answering 409.
+a traceback; always JSON, never aiohttp's default text/plain).
 """
 
 from __future__ import annotations
@@ -46,7 +40,7 @@ from aiohttp import WSMsgType, web
 from fpgas_tt import __version__, designs
 from fpgas_tt.bridge import BoardNotPresent, Bridge
 from fpgas_tt.config import BoardConfig, discover, parse_hostname
-from fpgas_tt.designs import DEMOS_DIR_DEFAULT, DesignNotFound, ValidationError
+from fpgas_tt.designs import DEMOS_DIR_DEFAULT, UPLOADS_DIR_DEFAULT, DesignNotFound, ValidationError
 from fpgas_tt.repl import ReplBusy, ReplError, ReplNoBoard, ReplRunner
 from fpgas_tt.usbinfo import vid_pid_for_tty
 
@@ -61,11 +55,6 @@ LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 # ourselves; a vanished client must not hold up shutdown.
 CLOSE_REPLY_TIMEOUT = 2.0
 SHUTDOWN_TIMEOUT = 5.0
-DEMO_SYNC_RETRY = 30.0
-# POST /demos/sync riding out a startup auto-sync still in flight: bounded
-# retries * delay = ~1s worst case before it finally surfaces 409.
-DEMOS_SYNC_BUSY_RETRIES = 10
-DEMOS_SYNC_BUSY_RETRY_DELAY = 0.1
 # A little over the bitstream cap so multipart framing overhead never trips
 # this before designs.validate_bitstream gets to give a proper 400. aiohttp
 # >=3.9's request.multipart() honours Application's client_max_size on its
@@ -90,6 +79,7 @@ def create_app(
     version: str = __version__,
     config_error: str | None = None,
     demos_dir: Path | str = DEMOS_DIR_DEFAULT,
+    uploads_dir: Path | str = UPLOADS_DIR_DEFAULT,
 ) -> web.Application:
     # See MULTIPART_MAX_BYTES: this only fully protects non-multipart bodies
     # and aiohttp >=3.9's multipart parsing; bitstream_upload has its own
@@ -102,6 +92,7 @@ def create_app(
     app["started"] = time.monotonic()
     app["websockets"] = set()
     app["demos_dir"] = Path(demos_dir)
+    app["uploads_dir"] = Path(uploads_dir)
     app["repl"] = ReplRunner(bridge)
     app.add_routes(
         [
@@ -110,13 +101,9 @@ def create_app(
             web.get("/designs", designs_list),
             web.post("/designs/{name}/enable", designs_enable),
             web.post("/bitstream", bitstream_upload),
-            web.post("/demos/sync", demos_sync),
         ]
     )
     app.on_shutdown.append(close_websockets)
-    if config.kind == "fpga":
-        app.on_startup.append(start_demo_sync)
-        app.on_cleanup.append(stop_demo_sync)
     return app
 
 
@@ -173,7 +160,8 @@ async def designs_list(request: web.Request) -> web.Response:
         return err
 
     async def go():
-        return web.json_response(await designs.list_designs(request.app["repl"], request.app["demos_dir"]))
+        app = request.app
+        return web.json_response(await designs.list_designs(app["repl"], app["demos_dir"], app["uploads_dir"]))
 
     return await _run(request, go())
 
@@ -201,8 +189,11 @@ async def designs_enable(request: web.Request) -> web.Response:
                 return _json_error(400, f"clock_hz must be between {CLOCK_HZ_MIN} and {CLOCK_HZ_MAX}")
 
     async def go():
+        app = request.app
         return web.json_response(
-            await designs.enable_design(request.app["repl"], request.match_info["name"], clock_hz)
+            await designs.enable_design(
+                app["repl"], request.match_info["name"], clock_hz, app["demos_dir"], app["uploads_dir"]
+            )
         )
 
     return await _run(request, go())
@@ -256,72 +247,13 @@ async def bitstream_upload(request: web.Request) -> web.Response:
     except ValidationError as exc:
         return _json_error(exc.status, str(exc))
 
-    async def go():
-        repl = request.app["repl"]
-        evicted = await designs.evict_uploads(repl, set(demos), keep=designs.MAX_UPLOADS - 1)
-        await designs.write_bitstream(repl, name, data)
-        return web.json_response({"name": name, "size": len(data), "evicted": evicted}, status=201)
-
-    return await _run(request, go())
-
-
-async def demos_sync(request: web.Request) -> web.Response:
-    if (err := _fpga_only(request)) is not None:
-        return err
-
-    async def go():
-        out = await _sync_demos_retrying_busy(request.app["repl"], request.app["demos_dir"])
-        return web.json_response(out)
-
-    return await _run(request, go())
-
-
-async def _sync_demos_retrying_busy(repl: ReplRunner, demos_dir: Path) -> dict:
-    """Sync is idempotent and often called right as the daemon boots, when
-    the startup auto-sync (``start_demo_sync``) may still be finishing its
-    own run. Rather than bounce that overlap straight to a 409 a caller has
-    to retry themselves, ride out a short, bounded window of ``ReplBusy``
-    before giving up -- the final attempt still surfaces 409 through `_run`
-    exactly as any other genuinely-busy REPL task does."""
-    for _ in range(DEMOS_SYNC_BUSY_RETRIES - 1):
-        try:
-            return await designs.sync_demos(repl, demos_dir)
-        except ReplBusy:
-            await asyncio.sleep(DEMOS_SYNC_BUSY_RETRY_DELAY)
-    return await designs.sync_demos(repl, demos_dir)  # last attempt: let ReplBusy propagate to `_run`
-
-
-async def start_demo_sync(app: web.Application) -> None:
-    async def loop() -> None:
-        bridge: Bridge = app["bridge"]
-        while True:
-            if bridge.present:
-                try:
-                    out = await designs.sync_demos(app["repl"], app["demos_dir"])
-                    log.info("demos: synced=%s skipped=%s", out["synced"], out["skipped"])
-                    return
-                except ReplError as exc:
-                    log.warning("demos: sync failed (%s); retrying in %ss", exc, DEMO_SYNC_RETRY)
-                    await asyncio.sleep(DEMO_SYNC_RETRY)
-                    continue
-                except Exception:
-                    # Must never die silently: an unexpected bug here would
-                    # otherwise leave the board without demos forever, with
-                    # nothing in the logs pointing at why.
-                    log.exception("demos: sync task raised an unexpected exception; retrying in %ss", DEMO_SYNC_RETRY)
-                    await asyncio.sleep(DEMO_SYNC_RETRY)
-                    continue
-            await asyncio.sleep(0.2)
-
-    app["demo_sync_task"] = asyncio.create_task(loop(), name="fpgas-tt-demo-sync")
-
-
-async def stop_demo_sync(app: web.Application) -> None:
-    task = app.get("demo_sync_task")
-    if task:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    # Kept on the Pi: the board is not involved until somebody loads it.
+    try:
+        evicted = await asyncio.to_thread(designs.store_upload, request.app["uploads_dir"], name, data)
+    except OSError as exc:
+        log.exception("upload: could not keep %s", name)
+        return _json_error(500, "the upload could not be kept on the Pi", type(exc).__name__)
+    return web.json_response({"name": name, "size": len(data), "evicted": evicted}, status=201)
 
 
 async def health(request: web.Request) -> web.Response:
@@ -431,6 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--baudrate", type=int, default=115200)
     p.add_argument("--log-level", default="INFO", choices=list(LOG_LEVELS))
     p.add_argument("--demos-dir", default=str(DEMOS_DIR_DEFAULT), help="directory of demo bitstreams + index.json")
+    p.add_argument("--uploads-dir", default=str(UPLOADS_DIR_DEFAULT), help="directory, on this Pi, that keeps uploads")
     return p
 
 
@@ -454,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
              args.device)
 
     bridge = Bridge(args.device, baudrate=args.baudrate)
-    app = create_app(bridge, config, config_error=config_error, demos_dir=args.demos_dir)
+    app = create_app(bridge, config, config_error=config_error, demos_dir=args.demos_dir, uploads_dir=args.uploads_dir)
 
     async def on_startup(_app: web.Application) -> None:
         await bridge.start()
