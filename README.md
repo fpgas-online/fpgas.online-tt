@@ -26,19 +26,24 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
 - Discovers which board it is from its hostname (`pi-sw<switch>-p<port>`) and
   `/etc/fpgas-online/tt-boards.yaml` (baked into the Pi NFS root by
   fpgas.online-infra). Unknown hostname ⇒ plain `asic` bridge.
-- On `kind: fpga` boards, four extra routes manage bitstreams on the board's
-  raw MicroPython REPL — a task run through the bridge like any other client,
-  never a second owner of the port:
+- On `kind: fpga` boards, three extra routes list, load and accept designs.
+  **Nothing writes to the demo board's filesystem.** Every design is a file on
+  the Pi: the packaged demos (`--demos-dir`) and visitors' uploads
+  (`--uploads-dir`). Loading one sends its bytes over the board's raw
+  MicroPython REPL into a buffer in the RP2350's memory and has the SDK's own
+  loader clock that buffer into the iCE40, so the board ends in the state the
+  SDK's `tt.shuttle.<design>.enable()` leaves, with no file involved. The REPL
+  work is a task run through the bridge like any other client, never a second
+  owner of the port.
 
   | Route | Description |
   |-------|-------------|
-  | `GET /designs` | `{"enabled": str\|null, "designs": [{"name", "title", "author", "description", "docs_url", "repo_url", "clock_hz", "pinout", "source": "demo"\|"upload"}, ...]}` — every `.bin` under `/bitstreams`, demo metadata merged in from `index.json` when it matches a name |
-  | `POST /designs/{name}/enable` | body `{"clock_hz": int}` (optional) → `{"enabled": name, "clock_hz": int\|null}`; bounded to a 25 s overall REPL deadline (below the site proxy's own 30 s/45 s read timeouts, so a stuck SPI load still gets a clean 502 from this daemon instead of the client seeing a raw connection reset) |
-  | `POST /bitstream` | multipart form (`name`, `file`) → `201 {"name", "size", "evicted": [str, ...]}`; rejects names that collide with a demo, non-`[a-z0-9_]{1,40}` names, oversize (>256 KiB) or non-iCE40 files (400); evicts the oldest non-demo uploads first so at most 16 uploads remain |
-  | `POST /demos/sync` | (re)writes any demo whose sha1 no longer matches a manifest kept on the board (`/bitstreams/.demos.json`) — a same-size content update is still noticed, unlike a plain size comparison → `{"synced": [str, ...], "skipped": [str, ...]}`; waits up to ~1 s for a running task before answering 409 |
+  | `GET /designs` | `{"enabled": str\|null, "designs": [{"name", "title", "author", "description", "docs_url", "repo_url", "clock_hz", "pinout", "source": "demo"\|"upload"}, ...]}` — every demo whose `.bin` is on the Pi, with its metadata from `index.json`, and every upload; `enabled` is what the board's SDK says is loaded (`null` when the SDK is not running) |
+  | `POST /designs/{name}/enable` | body `{"clock_hz": int}` (optional) → `{"enabled": name, "clock_hz": int\|null}`; starts the SDK with the board's own `main.py` if it is not running, sends the bitstream and loads it; bounded to a 25 s overall REPL deadline (below the site proxy's own 30 s/45 s read timeouts, so a stuck load still gets a clean 502 from this daemon instead of the client seeing a raw connection reset) |
+  | `POST /bitstream` | multipart form (`name`, `file`) → `201 {"name", "size", "evicted": [str, ...]}`; kept on the Pi, the board is not involved; rejects names that collide with a demo, non-`[a-z0-9_]{1,40}` names, oversize (>256 KiB) or non-iCE40 files (400); removes the oldest uploads first so at most 16 remain |
 
   Non-fpga boards get `404 {"error": "not an fpga board", "detail": ""}` on
-  all four. Other error shapes (`{"error": str, "detail": str}`): `503 board
+  all three. Other error shapes (`{"error": str, "detail": str}`): `503 board
   not present`, `409 another task is running` (or a demo-name collision on
   upload), `404 no such design` (including a name that could never be
   valid — rejected before the board is asked), `502 REPL task failed`
@@ -47,10 +52,13 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   anything unexpected (logged with a traceback; always JSON, never a bare
   crash page).
 - `--demos-dir` (default `/usr/share/fpgas-tt/demos`) points at the demo
-  bitstream set (`index.json` + `<name>.bin` files). On fpga boards, once the
-  board is first present the daemon runs one `/demos/sync` automatically in
-  the background (retrying every 30 s on failure) so newly baked images come
-  up with the demo set already on the board.
+  bitstream set (`index.json` + `<name>.bin` files). `--uploads-dir` (default
+  `/var/lib/fpgas-tt/uploads`, the service's `StateDirectory`) keeps uploads;
+  on the fleet's Pis that is lost at a reboot, like everything else a visitor
+  leaves on a Pi.
+- Until 2026-10 the daemon copied every demo and every upload to the board's
+  `/bitstreams` and loaded from there. Boards from that time still hold those
+  files; the daemon neither reads nor removes them.
 
 The KianV boot macro is a later phase; it too will be a task that goes
 *through* the bridge as a client — there is only ever one owner of the
