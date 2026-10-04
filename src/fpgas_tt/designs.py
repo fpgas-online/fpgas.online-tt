@@ -16,12 +16,15 @@ boot check) leaves the board without it, so loading first runs main.py when ``tt
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 
 from fpgas_tt.repl import ReplError, ReplRunner
@@ -33,7 +36,7 @@ DEMOS_DIR_DEFAULT = Path("/usr/share/fpgas-tt/demos")
 UPLOADS_DIR_DEFAULT = Path("/var/lib/fpgas-tt/uploads")
 MAX_BITSTREAM_BYTES = 256 * 1024
 MAX_UPLOADS = 16
-NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+NAME_RE = re.compile(r"^[a-z0-9_]{1,40}\Z")  # \Z, not $: a trailing newline is not part of a name
 ICE40_PREAMBLE = b"\x7e\xaa\x99\x7e"
 PREAMBLE_WINDOW = 64
 CHUNK = 1024  # raw bytes per REPL step (1368 base64 chars on the wire)
@@ -59,13 +62,6 @@ def _parse_json(out: str):
     try:
         return json.loads(out)
     except (ValueError, TypeError) as exc:
-        raise ReplError("board returned unparseable output", out) from exc
-
-
-def _parse_int(out: str) -> int:
-    try:
-        return int(out.strip())
-    except ValueError as exc:
         raise ReplError("board returned unparseable output", out) from exc
 
 
@@ -114,6 +110,9 @@ def validate_bitstream(name: str, data: bytes, demo_names: set[str]) -> None:
 
 
 # -- the Pi's own store --
+_STORE_LOCK = threading.Lock()
+
+
 def _demo_file(demos_dir: Path, name: str) -> Path:
     return Path(demos_dir) / f"{name}.bin"
 
@@ -137,7 +136,8 @@ def design_names(demos_dir: Path, uploads_dir: Path) -> list[str]:
     missing = sorted(set(demos) - here)
     if missing:
         log.warning("demos: listed in index.json but the bitstream is missing: %s", ", ".join(missing))
-    return sorted(here | {n for n in _upload_names(uploads_dir) if n not in demos})
+    # the same rule as design_file: an upload is hidden only by a demo that is really here
+    return sorted(here | set(_upload_names(uploads_dir)))
 
 
 def design_file(demos_dir: Path, uploads_dir: Path, name: str) -> Path:
@@ -156,41 +156,40 @@ def store_upload(uploads_dir: Path, name: str, data: bytes, keep: int = MAX_UPLO
     """Keep upload `name` on the Pi, and at most `keep` uploads in all: the names of the oldest ones removed
     to make room. The file appears under its name whole or not at all."""
     uploads_dir = Path(uploads_dir)
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=uploads_dir, prefix=f".{name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.replace(tmp, _upload_file(uploads_dir, name))
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
-    others = [n for n in _upload_names(uploads_dir) if n != name]
-    others.sort(key=lambda n: (_upload_file(uploads_dir, n).stat().st_mtime, n))
-    evicted = others[: max(0, len(others) - (keep - 1))]
-    for n in evicted:
-        _upload_file(uploads_dir, n).unlink()
-    return evicted
+    with _STORE_LOCK:  # one upload at a time: two making room at once would remove each other's files
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=uploads_dir, prefix=f".{name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, _upload_file(uploads_dir, name))
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+        others = [n for n in _upload_names(uploads_dir) if n != name]
+        others.sort(key=lambda n: (_upload_file(uploads_dir, n).stat().st_mtime, n))
+        evicted = others[: max(0, len(others) - (keep - 1))]
+        for n in evicted:
+            _upload_file(uploads_dir, n).unlink(missing_ok=True)
+        return evicted
 
 
 # -- snippets --
 # What the board's SDK has loaded. None of this touches a file. `tt` is missing after a raw-REPL soft reset
-# until the board's main.py has run again: that reads as "nothing loaded", not as a failure.
+# until the board's main.py has run again, and is None when a start of the SDK was cut short (its main.py sets
+# `tt = None` before it builds the board): both read as "nothing loaded", not as a failure.
 ENABLED_CODE = (
     "import json\n"
-    "try:\n"
-    "    _fo_en = tt.shuttle.enabled\n"
-    "except NameError:\n"
-    "    _fo_en = None\n"
+    "_fo_tt = globals().get('tt')\n"
+    "_fo_en = _fo_tt.shuttle.enabled if _fo_tt is not None else None\n"
     "print(json.dumps({'enabled': _fo_en.name if _fo_en else None}))\n"
 )
 
-# Run first when loading: the SDK's `tt` object, built by the board's own main.py when it is not there. That is
-# the SDK's normal start, read from the board and run as it is; main.py's own output is not the answer.
+# Run first when loading: the SDK's `tt` object, built by the board's own main.py when it is not there (or is
+# the None a cut-short start left). That is the SDK's normal start, read from the board and run as it is;
+# main.py's own output is not the answer.
 ENSURE_SDK_CODE = (
-    "try:\n"
-    "    tt\n"
-    "except NameError:\n"
+    "if globals().get('tt') is None:\n"
     "    with open('main.py') as _fo_f:\n"
     "        _fo_main = _fo_f.read()\n"
     "    exec(_fo_main)\n"
@@ -199,15 +198,31 @@ ENSURE_SDK_CODE = (
     "print('sdk')\n"
 )
 
+# Before the buffer is made: whatever an earlier load that was cut short left behind is let go first, so two
+# buffers never have to fit in the board's memory at once.
+BUFFER_CODE = """\
+_fo_buf = None
+_fo_reader = None
+_fo_d = None
+import gc, binascii
+gc.collect()
+_fo_buf = bytearray(__SIZE__)
+_fo_n = 0
+print('buffer')
+"""
+
 # The SDK's loader reads its bitstream with `open(path, 'rb')` and `.read(128)`. For the one load, the loader
-# module's own `open` is this reader over the buffer in memory; it is taken away again whatever happens.
+# module's own `open` is this reader over the buffer in memory; it is taken away again whatever happens. The
+# buffer is checked against the Pi's SHA-256 before anything is loaded. The SDK names the design as enabled
+# before it has transferred it, and its loader prints an OSError instead of raising it: so a load that failed,
+# or did not read every byte, leaves `tt.shuttle.enabled` as None, never the design's name.
 LOAD_CODE = """\
-import gc
+import gc, binascii, hashlib
 import ttboard.fpga.fabricfoxv2 as _fo_loader
 from ttboard.fpga.fpga_mux import BitStream as _fo_BitStream
 class _fo_Reader:
     def __init__(self, buf):
-        self.buf = buf
+        self.buf = memoryview(buf)
         self.at = 0
     def read(self, n):
         data = bytes(self.buf[self.at:self.at + n])
@@ -217,27 +232,39 @@ class _fo_Reader:
         return self
     def __exit__(self, *a):
         return False
-if _fo_n != __SIZE__:
-    raise ValueError('bitstream incomplete: %d of __SIZE__ bytes' % _fo_n)
-_fo_reader = _fo_Reader(_fo_buf)
-_fo_loader.open = lambda path, mode='rb': _fo_reader
 try:
-    tt.shuttle.enable(_fo_BitStream(tt.shuttle, __PATH__, __NAME__))
-finally:
     del _fo_loader.open
-    _fo_sent = _fo_reader.at
+except AttributeError:
+    pass
+_fo_ok = False
+try:
+    if _fo_n != __SIZE__:
+        raise ValueError('bitstream incomplete: %d of __SIZE__ bytes' % _fo_n)
+    if binascii.hexlify(hashlib.sha256(_fo_buf).digest()).decode() != __SHA256__:
+        raise ValueError('the bitstream did not arrive as it was sent')
+    _fo_reader = _fo_Reader(_fo_buf)
+    _fo_loader.open = lambda path, mode='rb': _fo_reader
+    tt.shuttle.enable(_fo_BitStream(tt.shuttle, __PATH__, __NAME__, -1))
+    if _fo_reader.at != __SIZE__:
+        raise ValueError('the loader read %d of __SIZE__ bytes' % _fo_reader.at)
+    _fo_ok = True
+finally:
+    try:
+        del _fo_loader.open
+    except AttributeError:
+        pass
+    if not _fo_ok:
+        tt.shuttle.enabled = None
     _fo_buf = None
     _fo_reader = None
     gc.collect()
-if _fo_sent != __SIZE__:
-    raise ValueError('the loader read %d of __SIZE__ bytes' % _fo_sent)
 __CLOCK__print('enabled')
 """
 
 
 def _load_steps(name: str, data: bytes, clock_hz: int | None) -> list[str]:
     """The REPL steps that put `data` into a buffer in the board's memory and have the SDK load it."""
-    steps = [f"import gc, binascii\ngc.collect()\n_fo_buf = bytearray({len(data)})\n_fo_n = 0\nprint('buffer')\n"]
+    steps = [BUFFER_CODE.replace("__SIZE__", str(len(data)))]
     for i in range(0, len(data), CHUNK):
         b64 = base64.b64encode(data[i : i + CHUNK]).decode("ascii")
         steps.append(
@@ -246,6 +273,7 @@ def _load_steps(name: str, data: bytes, clock_hz: int | None) -> list[str]:
     clock = f"tt.clock_project_PWM({int(clock_hz)})\n" if clock_hz is not None else ""
     steps.append(
         LOAD_CODE.replace("__SIZE__", str(len(data)))
+        .replace("__SHA256__", repr(hashlib.sha256(data).hexdigest()))
         .replace("__PATH__", repr(f"pi:{name}.bin"))  # not a path on the board: the reader never looks at it
         .replace("__NAME__", repr(name))
         .replace("__CLOCK__", clock)
@@ -253,17 +281,29 @@ def _load_steps(name: str, data: bytes, clock_hz: int | None) -> list[str]:
     return steps
 
 
+def _listing(demos_dir: Path, uploads_dir: Path) -> list[dict]:
+    demos = load_demo_index(demos_dir)
+    return [_meta(n, demos) for n in design_names(demos_dir, uploads_dir)]
+
+
+def _read_design(demos_dir: Path, uploads_dir: Path, name: str) -> bytes:
+    try:
+        return design_file(demos_dir, uploads_dir, name).read_bytes()
+    except FileNotFoundError as exc:  # an upload removed to make room, between finding it and reading it
+        raise DesignNotFound(name) from exc
+
+
 async def list_designs(runner: ReplRunner, demos_dir: Path, uploads_dir: Path) -> dict:
     out = _parse_json(await runner.exec(ENABLED_CODE))
-    demos = load_demo_index(demos_dir)
-    return {"enabled": out["enabled"], "designs": [_meta(n, demos) for n in design_names(demos_dir, uploads_dir)]}
+    # The Pi's root is on NFS: its files are read off the event loop, which also serves the serial bridge.
+    return {"enabled": out["enabled"], "designs": await asyncio.to_thread(_listing, demos_dir, uploads_dir)}
 
 
 async def enable_design(
     runner: ReplRunner, name: str, clock_hz: int | None, demos_dir: Path, uploads_dir: Path
 ) -> dict:
     # design_file refuses a name the Pi could never have before anything goes near the board.
-    data = design_file(demos_dir, uploads_dir, name).read_bytes()
+    data = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name)
     # One REPL session, so nobody else's bytes come between the SDK check, the buffer and the load. timeout
     # (per-read) stays 30s -- the SPI load takes a few seconds and any single read waiting on it is normal;
     # overall is intentionally tighter (see ENABLE_OVERALL_TIMEOUT).

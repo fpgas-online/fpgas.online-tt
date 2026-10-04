@@ -28,8 +28,13 @@ FRIENDLY_BANNER = b"\r\nMicroPython v1.25 fake; FPGA\r\nType \"help()\" for more
 DEFAULT_RAW_PREAMBLE = b"\r\n>>> \r\n"
 
 
+class BoardWrite(AssertionError):
+    """Something the daemon sent tried to change the board's filesystem. Nothing may (Tim, 2026-10-05)."""
+
+
 class _FakeOs:
-    """os.listdir/stat/remove/mkdir rooted under `root`, path strings as MicroPython sees them."""
+    """os.listdir/stat rooted under `root`, path strings as MicroPython sees them. Everything that would change
+    the board's filesystem raises BoardWrite: no snippet of the daemon's may do it."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -46,13 +51,16 @@ class _FakeOs:
         return (st.st_mode, 0, 0, 0, 0, 0, st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime))
 
     def remove(self, path: str):
-        os.remove(self._p(path))
+        raise BoardWrite(f"os.remove({path!r})")
 
     def rename(self, src: str, dst: str):
-        os.rename(self._p(src), self._p(dst))
+        raise BoardWrite(f"os.rename({src!r}, {dst!r})")
 
     def mkdir(self, path: str):
-        os.mkdir(self._p(path))
+        raise BoardWrite(f"os.mkdir({path!r})")
+
+    unlink = remove
+    rmdir = remove
 
 
 @dataclass
@@ -176,7 +184,12 @@ class FakeRepl:
         self._task: asyncio.Task | None = None
 
         def _open(path, mode="r", *a, **k):  # MicroPython's open() is relative to its own FS root
+            if mode not in ("r", "rb", "rt"):
+                self.board_writes.append(f"open({path!r}, {mode!r})")
+                raise BoardWrite(f"open({path!r}, {mode!r})")
             return builtins.open(self.fos._p(path), mode, *a, **k)
+
+        self.board_writes: list[str] = []  # also kept here: a snippet could catch the exception
 
         # The SDK's modules a snippet may import. The loader module has no `open` of its own: it finds the
         # board's through its builtins, as on the board.

@@ -59,6 +59,17 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
 - Until 2026-10 the daemon copied every demo and every upload to the board's
   `/bitstreams` and loaded from there. Boards from that time still hold those
   files; the daemon neither reads nor removes them.
+  The SDK on the board does not know about any of this: its own list
+  (`tt.shuttle.projects`) is still the board's `/bitstreams`, so
+  `tt.shuttle.<name>.enable()` typed at the board's prompt loads the board's old
+  copy of that name, not the Pi's, and uploads are not in that list at all. The
+  design the daemon loaded is `tt.shuttle.enabled` (project index -1, in no
+  list); calling `.enable()` on it again at the prompt loads nothing, because
+  it has no file on the board.
+- A load checks the buffer on the board against the Pi's SHA-256 before the
+  FPGA is touched, and a load that fails, or in which the SDK's loader did not
+  read every byte, leaves `enabled` as `null`, never the name of a design that
+  is not running.
 
 The KianV boot macro is a later phase; it too will be a task that goes
 *through* the bridge as a client — there is only ever one owner of the

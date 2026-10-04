@@ -31,6 +31,9 @@ async def runner(fake_board, fake_repl):
     await wait_for(lambda: b.present)
     yield ReplRunner(b)
     await b.stop()
+    # The fake board refuses every change to its filesystem (fakerepl.BoardWrite); this catches one that a
+    # snippet tried and swallowed.
+    assert fake_repl.board_writes == []
 
 
 def board_tree(fake_repl) -> dict[str, bytes | None]:
@@ -64,11 +67,13 @@ def test_load_demo_index_drops_entries_with_invalid_names(tmp_path):
     assert set(designs.load_demo_index(tmp_path)) == {"ok_name"}
 
 
-def test_parse_json_and_parse_int_raise_replerror_on_garbage():
+def test_parse_json_raises_replerror_on_garbage():
     with pytest.raises(ReplError):
         designs._parse_json("this is not json")
-    with pytest.raises(ReplError):
-        designs._parse_int("this is not an int")
+
+
+def test_a_name_with_a_trailing_newline_is_not_a_name():
+    assert designs.NAME_RE.match("abc") and not designs.NAME_RE.match("abc\n")
 
 
 @pytest.mark.parametrize(
@@ -145,6 +150,32 @@ def test_store_upload_removes_the_oldest_uploads_beyond_the_limit(uploads):
     os.utime(uploads / "up_newest.bin", (1, 1))
     assert designs.store_upload(uploads, "up_newest", PRE, keep=1) == ["up_mid", "up_new"]
     assert designs.design_names(DEMOS / "nope", uploads) == ["up_newest"]
+
+
+def test_what_is_listed_is_what_can_be_loaded(tmp_path, uploads):
+    """An upload whose name a later index.json lists without a bitstream is still the upload."""
+    designs.store_upload(uploads, "later_a_demo", PRE)
+    (tmp_path / "index.json").write_text('{"demos": [{"name": "later_a_demo"}]}')
+    assert designs.design_names(tmp_path, uploads) == ["later_a_demo"]
+    assert designs.design_file(tmp_path, uploads, "later_a_demo") == uploads / "later_a_demo.bin"
+
+
+def test_uploads_at_the_same_time_do_not_trip_over_each_others_evictions(uploads):
+    import concurrent.futures
+
+    for i in range(4):
+        designs.store_upload(uploads, f"old_{i}", PRE, keep=4)
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        done = [pool.submit(designs.store_upload, uploads, f"new_{i}", PRE + bytes([i]), 4) for i in range(8)]
+        evicted = [n for f in done for n in f.result()]  # .result() raises what the upload raised
+    assert len(designs.design_names(DEMOS / "nope", uploads)) == 4 and len(evicted) == len(set(evicted)) == 8
+
+
+async def test_an_upload_removed_before_it_is_read_is_not_found(runner, fake_repl, uploads, monkeypatch):
+    monkeypatch.setattr(designs, "design_file", lambda demos_dir, uploads_dir, name: uploads / "evicted.bin")
+    with pytest.raises(designs.DesignNotFound):
+        await designs.enable_design(runner, "evicted", None, DEMOS, uploads)
+    assert fake_repl.transcript == b""
 
 
 # -- the board: read what is loaded, load from memory, write nothing --
@@ -244,6 +275,60 @@ async def test_enable_design_fails_when_the_sdks_loader_did_not_read_the_whole_b
     assert not hasattr(fake_repl.loader, "open")
 
 
+async def test_a_load_that_failed_is_not_reported_as_loaded(runner, fake_repl, uploads, monkeypatch):
+    """The SDK names the design as enabled before it has transferred it."""
+    await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    monkeypatch.setattr(fake_repl.loader, "spi_transferPIO", lambda filepath, freq=1_000_000: None)
+    with pytest.raises(ReplError):
+        await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
+    assert (await designs.list_designs(runner, DEMOS, uploads))["enabled"] is None  # not demo_b, and not demo_a
+
+
+async def test_a_bitstream_that_did_not_arrive_as_sent_is_not_loaded(runner, fake_repl, uploads, monkeypatch):
+    real = designs._load_steps
+
+    def corrupted(name, data, clock_hz):
+        steps = real(name, data, clock_hz)
+        return [*steps[:-1], "_fo_buf[5] ^= 0xff\n", steps[-1]]
+
+    monkeypatch.setattr(designs, "_load_steps", corrupted)
+    with pytest.raises(ReplError) as ei:
+        await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    assert "did not arrive as it was sent" in str(ei.value.detail)
+    assert fake_repl.loaded == [] and fake_repl.tt.shuttle.enable_log == []
+
+
+async def test_a_load_cut_short_leaves_nothing_that_stops_the_next_one(runner, fake_repl, uploads):
+    """Whatever cut it short (a deadline, a Commander connecting): the next load lets the old buffer go before it
+    makes its own, and takes a loader `open` left behind away."""
+    data = PRE + bytes(range(256)) * 20
+    designs.store_upload(uploads, "my_upload", data)
+    await runner.exec_steps(designs._load_steps("my_upload", data, None)[:3])  # buffer and two chunks, no load
+    assert len(fake_repl._globals["_fo_buf"]) == len(data)
+    fake_repl.loader.open = lambda path, mode="rb": None  # as if cut short between the load and its clean-up
+    seen = []
+    real_bytearray = bytearray
+
+    def bytearray_seeing_the_old_buffer(n):
+        seen.append(fake_repl._globals["_fo_buf"])
+        return real_bytearray(n)
+
+    fake_repl._globals["bytearray"] = bytearray_seeing_the_old_buffer
+    await designs.enable_design(runner, "my_upload", None, DEMOS, uploads)
+    assert seen == [None]  # the old buffer was let go before the new one was made
+    assert fake_repl.loaded == [("pi:my_upload.bin", data)] and not hasattr(fake_repl.loader, "open")
+
+
+async def test_a_board_whose_sdk_start_was_cut_short_is_started_again(runner, fake_repl, uploads):
+    """The SDK's main.py sets `tt = None` before it builds the board: interrupted there, `tt` exists and is None."""
+    fake_repl._globals["_the_sdk"] = fake_repl._globals["tt"]
+    fake_repl._globals["tt"] = None
+    (fake_repl.root / "main.py").write_text("tt = None\ntt = _the_sdk\n")
+    assert (await designs.list_designs(runner, DEMOS, uploads))["enabled"] is None
+    await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    assert fake_repl._globals["tt"] is fake_repl.tt and fake_repl.tt.shuttle.enable_log == ["tt_um_demo_a"]
+
+
 async def test_a_failed_load_gives_the_loader_its_own_open_back(runner, fake_repl, uploads, monkeypatch):
     def breaks(design, force=False):
         raise RuntimeError("pins")
@@ -286,11 +371,31 @@ def sent_to_the_board(source: str) -> list[str]:
     ]  # fmt: skip
 
 
-@pytest.mark.parametrize("path", sorted((Path(designs.__file__).parent).glob("*.py")), ids=lambda p: p.name)
-def test_nothing_the_daemon_sends_to_the_board_can_change_a_file_on_it(path):
+@pytest.mark.parametrize("path", sorted((Path(designs.__file__).parent).rglob("*.py")), ids=lambda p: p.name)
+def test_no_text_in_the_daemon_reads_like_a_board_write(path):
+    """A tripwire, not a proof: it reads the daemon's literal text, so it catches the old snippets coming back
+    and their obvious relatives, not a write built at run time. What holds every test to the rule is the fake
+    board, which refuses any change to its filesystem (fakerepl.BoardWrite)."""
     found = [(text[:80], BOARD_WRITE.search(text).group()) for text in sent_to_the_board(path.read_text())
              if BOARD_WRITE.search(text)]  # fmt: skip
     assert not found, found
+
+
+def test_the_steps_of_a_load_as_sent_do_not_read_like_a_board_write():
+    for step in [designs.ENSURE_SDK_CODE, designs.ENABLED_CODE, *designs._load_steps("my_upload", PRE * 600, 1000)]:
+        assert not BOARD_WRITE.search(step), BOARD_WRITE.search(step)
+
+
+async def test_the_fake_board_refuses_what_the_daemon_used_to_send(runner, fake_repl):
+    from tests.fakerepl import BoardWrite  # noqa: F401 - named for the reader; it reaches us as a REPL error
+
+    for code in ("f = open('/bitstreams/x.bin.tmp', 'wb')\n", "import os\nos.remove('/bitstreams/x.bin')\n",
+                 "import os\nos.rename('/a', '/b')\n", "import os\nos.mkdir('/bitstreams')\n"):  # fmt: skip
+        with pytest.raises(ReplError) as ei:
+            await runner.exec(code)
+        assert "BoardWrite" in str(ei.value.detail)
+    assert fake_repl.board_writes == ["open('/bitstreams/x.bin.tmp', 'wb')"]
+    fake_repl.board_writes.clear()  # these were this test's own
 
 
 @pytest.mark.parametrize(

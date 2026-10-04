@@ -103,7 +103,7 @@ class ReplRunner:
                         # to this Ctrl-B. Wait (briefly) for that friendly
                         # prompt before releasing this client: the very next
                         # task may subscribe its own client immediately
-                        # afterwards (e.g. sync/eviction loops issue several
+                        # afterwards (e.g. a caller that issues several
                         # sessions back to back), and if these leftover
                         # "leaving raw REPL" bytes are still in flight when
                         # it does, they land in the new session's read
