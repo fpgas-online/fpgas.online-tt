@@ -89,3 +89,6 @@ async def fake_repl(fake_board, tmp_path):
     repl.start()
     yield repl
     await repl.stop()
+    # Nothing the daemon sends may change a file on the board (Tim, 2026-10-05). The fake refuses every such
+    # attempt; this catches one that a snippet tried and swallowed, in every test that has a board.
+    assert repl.board_writes == []

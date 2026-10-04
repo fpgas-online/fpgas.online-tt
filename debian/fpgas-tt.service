@@ -9,6 +9,8 @@ StartLimitIntervalSec=0
 Type=simple
 User=pi
 SupplementaryGroups=dialout
+# Visitors' uploads are kept here, on the Pi (/var/lib/fpgas-tt/uploads): never on the demo board.
+StateDirectory=fpgas-tt
 ExecStart=/usr/bin/fpgas-tt --device /dev/ttboard --boards /etc/fpgas-online/tt-boards.yaml
 Restart=always
 RestartSec=1

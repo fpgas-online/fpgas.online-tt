@@ -33,6 +33,11 @@ LEAVE_DRAIN_TIMEOUT = 1.0  # bound on waiting for the friendly prompt on the way
 # fast instead of buffering forever.
 RAW_BANNER_PREAMBLE_CAP = 4096
 DEFAULT_OVERALL_TIMEOUT = 30.0  # floor for exec_steps' whole-session deadline
+# What the Commander sends when the board's SDK does not answer (tt-commander-app, TTBoardDevice.start()):
+# Ctrl-C twice to stop any running program, Ctrl-B to leave the raw REPL if it was entered, then Ctrl-D at the
+# friendly prompt, which soft-resets the board and so runs its boot.py and main.py.
+SOFT_RESET = (b"\x03\x03\x02", b"\x04")
+SOFT_REBOOT = b"soft reboot"  # MicroPython's own line on that Ctrl-D
 
 
 class ReplError(Exception):
@@ -103,7 +108,7 @@ class ReplRunner:
                         # to this Ctrl-B. Wait (briefly) for that friendly
                         # prompt before releasing this client: the very next
                         # task may subscribe its own client immediately
-                        # afterwards (e.g. sync/eviction loops issue several
+                        # afterwards (e.g. a caller that issues several
                         # sessions back to back), and if these leftover
                         # "leaving raw REPL" bytes are still in flight when
                         # it does, they land in the new session's read
@@ -123,6 +128,42 @@ class ReplRunner:
                     # wait_for's CancelledError) -- this client must never
                     # leak: unsubscribe it from the bridge no matter what.
                     client.close()
+
+
+    async def soft_reset(self, *, timeout: float = 10.0) -> str:
+        """Soft-reset the board from the friendly REPL, exactly as the Commander does when the SDK does not
+        answer, and wait for the board to be back at its prompt: what the board printed after the reset (its
+        main.py's output). Raises ReplError when the board does not reset or does not come back in time."""
+        if self._lock.locked():
+            raise ReplBusy("another task is running")
+        if not self._bridge.present:
+            raise ReplNoBoard("board not present")
+        async with self._lock:
+            client = self._bridge.subscribe()
+            seen = b""
+            try:
+                async with asyncio.timeout(timeout):
+                    for chunk in SOFT_RESET:
+                        await client.write(chunk)
+                    while True:
+                        data = await client.read()
+                        if data is None:
+                            if client.dropped:
+                                raise ReplError("soft reset lost its stream (board output overran the buffer)", seen)
+                            raise ReplNoBoard("board not present")
+                        seen += data
+                        after = seen.rpartition(SOFT_REBOOT)[2] if SOFT_REBOOT in seen else b""
+                        # back at the prompt: the friendly prompt at the start of a line. Not "at the end of
+                        # what was read": another client of the bridge may make the board print right after it.
+                        if b"\n" + FRIENDLY_PROMPT in after.replace(b"\r", b""):
+                            return after.decode("utf-8", "replace")
+            except TimeoutError as exc:
+                what = "come back to its prompt" if SOFT_REBOOT in seen else "soft-reset"
+                raise ReplError(f"the board did not {what} in time", seen) from exc
+            except BoardNotPresent as exc:
+                raise ReplNoBoard("board not present") from exc
+            finally:
+                client.close()
 
 
 class _Session:
