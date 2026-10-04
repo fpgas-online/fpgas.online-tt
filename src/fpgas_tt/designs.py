@@ -208,7 +208,8 @@ print('buffer')
 """
 
 # The SDK's loader reads its bitstream with `open(path, 'rb')` and `.read(128)`. For the one load, the loader
-# module's own `open` is this reader over the buffer in memory; it is taken away again whatever happens. The
+# module's own `open` is this reader over the buffer in memory; it is taken away again whatever happens
+# (deleting a module attribute that is not there is a KeyError on MicroPython, an AttributeError on CPython). The
 # buffer is checked against the Pi's SHA-256 before anything is loaded. The SDK names the design as enabled
 # before it has transferred it, and its loader prints an OSError instead of raising it: so a load that failed
 # once the FPGA was touched, or did not read every byte, leaves `tt.shuttle.enabled` as None, never the design's
@@ -232,7 +233,7 @@ class _fo_Reader:
         return False
 try:
     del _fo_loader.open
-except AttributeError:
+except (AttributeError, KeyError):
     pass
 _fo_ok = False
 _fo_touched = False
@@ -251,7 +252,7 @@ try:
 finally:
     try:
         del _fo_loader.open
-    except AttributeError:
+    except (AttributeError, KeyError):
         pass
     _fo_buf = None
     _fo_reader = None

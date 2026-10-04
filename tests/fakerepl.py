@@ -153,6 +153,16 @@ def spi_transferPIO(filepath, freq=1_000_000):
 """
 
 
+class _MicroPythonModule(types.ModuleType):
+    """A module as MicroPython has it in one respect that matters here: deleting an attribute that is not
+    there raises KeyError (seen on a demo board, 2026-10-05), where CPython raises AttributeError."""
+
+    def __delattr__(self, name):
+        if name not in self.__dict__:
+            raise KeyError(name)
+        super().__delattr__(name)
+
+
 class FakeMuxBitStream:
     """ttboard.fpga.fpga_mux.BitStream."""
 
@@ -199,7 +209,7 @@ class FakeRepl:
         # The SDK's modules a snippet may import. The loader module has no `open` of its own: it finds the
         # board's through its builtins, as on the board.
         self.loaded: list[tuple[str, bytes]] = []
-        loader = types.ModuleType("ttboard.fpga.fabricfoxv2")
+        loader = _MicroPythonModule("ttboard.fpga.fabricfoxv2")
         loader.__dict__.update({"__builtins__": {**vars(builtins), "open": _open}, "_loaded": self.loaded})
         exec(FAKE_LOADER, loader.__dict__)  # noqa: S102 - test double
         fpga_mux = types.ModuleType("ttboard.fpga.fpga_mux")
