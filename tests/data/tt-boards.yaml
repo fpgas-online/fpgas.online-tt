@@ -1,7 +1,0 @@
-# Same shape as the file fpgas.online-infra renders from host_vars `tt_boards`.
-tt_boards:
-  - {slug: tt06, port: 6, kind: asic, shuttle: tt06, title: "Tiny Tapeout 6"}
-  - {slug: tt03, port: 3, kind: asic, shuttle: tt03, title: "Tiny Tapeout 3", enabled: false}
-  - {slug: fpga-1, port: 12, kind: fpga, title: "TT FPGA emulation board 1"}
-  - {slug: kianv-1, port: null, kind: kianv, shuttle: tt06, title: "KianV uLinux SoC (TT06)"}
-  - {slug: sw2-thing, switch: 2, port: 1, kind: asic, title: "On switch two"}

@@ -1,10 +1,10 @@
 import os
 
 from fpgas_tt import usbinfo
-from fpgas_tt.usbinfo import vid_pid_for_tty
+from fpgas_tt.usbinfo import usb_serial_for_tty, vid_pid_for_tty
 
 
-def _fake_sysfs(tmp_path, tty="ttyACM0", vid="2e8a", pid="0005", depth=1):
+def _fake_sysfs(tmp_path, tty="ttyACM0", vid="2e8a", pid="0005", depth=1, serial=None):
     """Mirror the real shape: /sys/class/tty/<tty>/device is a symlink to the
     USB *interface* directory, and idVendor/idProduct live on its parent(s).
     """
@@ -15,6 +15,8 @@ def _fake_sysfs(tmp_path, tty="ttyACM0", vid="2e8a", pid="0005", depth=1):
     iface.mkdir(parents=True)
     (usbdev / "idVendor").write_text(vid + "\n")
     (usbdev / "idProduct").write_text(pid + "\n")
+    if serial is not None:
+        (usbdev / "serial").write_text(serial + "\n")
     root = tmp_path / "class" / "tty"
     (root / tty).mkdir(parents=True)
     os.symlink(iface, root / tty / "device")
@@ -48,3 +50,21 @@ def test_vid_pid_for_tty_none_for_pty(fake_board):
 def test_vid_pid_for_tty_none_when_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(usbinfo, "SYSFS_TTY_ROOT", str(tmp_path / "nope"))
     assert vid_pid_for_tty("/dev/ttyACM0") is None
+
+
+def test_usb_serial_for_tty_reads_sysfs(tmp_path, monkeypatch):
+    root = _fake_sysfs(tmp_path, pid="000f", depth=2, serial="a2961e5cac65b25f")
+    monkeypatch.setattr(usbinfo, "SYSFS_TTY_ROOT", str(root))
+    link = tmp_path / "ttboard"
+    os.symlink("/dev/ttyACM0", link)
+    assert usb_serial_for_tty(str(link)) == "a2961e5cac65b25f"
+
+
+def test_usb_serial_for_tty_none_without_a_serial(tmp_path, monkeypatch):
+    root = _fake_sysfs(tmp_path)
+    monkeypatch.setattr(usbinfo, "SYSFS_TTY_ROOT", str(root))
+    assert usb_serial_for_tty("/dev/ttyACM0") is None
+
+
+def test_usb_serial_for_tty_none_for_pty(fake_board):
+    assert usb_serial_for_tty(str(fake_board.path)) is None
