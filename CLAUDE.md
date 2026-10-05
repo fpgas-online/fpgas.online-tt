@@ -8,7 +8,8 @@ board plus a health endpoint. Design spec:
 
 ## Repository Overview
 
-- `src/fpgas_tt/config.py` — hostname → (switch, port); boards YAML; `discover()`
+- `src/fpgas_tt/identity.py` — what the board is, from its USB serial and the boot check's report; `identify()`
+- `src/fpgas_tt/usbinfo.py` — USB ids and serial number of the device behind a tty (sysfs)
 - `src/fpgas_tt/bridge.py` — `Bridge` (one serial owner) and `Client`
 - `src/fpgas_tt/server.py` — aiohttp app (`/health`, `/serial`) and CLI `main()`
 - `tests/` — pytest; a pty stands in for the board
@@ -16,7 +17,9 @@ board plus a health endpoint. Design spec:
 
 Invariants: exactly one owner of the serial port; every consumer (WebSocket
 viewers and future tasks) is a bridge client; no arbitration; slow clients are
-dropped, the reader never blocks; nothing is fetched or generated after boot.
+dropped, the reader never blocks; nothing is fetched or generated after boot;
+nothing says which switch port a board is on (a board is known by its USB
+serial, the value on its label); nothing writes to the demo board's files.
 
 ## Conventions
 

@@ -45,7 +45,6 @@ def test_nfpm_depends_on_bookworm_packages_only():
         "python3-aiohttp",
         "python3-serial",
         "python3-serial-asyncio",
-        "python3-yaml",
         "udev",
     }
 

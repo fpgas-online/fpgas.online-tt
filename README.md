@@ -15,17 +15,29 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   and may write bytes to it. No locking. A client that falls more than 256 KiB
   behind is dropped; the board reader is never blocked.
 - `GET /health` — `{"board": {"present": bool, "device": str,
-  "vid_pid": str|null}, "kind": str, "slug": str, "switch": int|null,
-  "port": int|null, "hostname": str, "clients": int, "uptime_s": int,
-  "version": str, "config_error": str|null}`. `vid_pid` is the board's USB
-  `idVendor:idProduct` read from sysfs (`null` if the device is not a USB
-  tty); `config_error` is non-null when the board map was unreadable and the
-  daemon fell back to a plain `asic` bridge instead of restart-looping.
+  "vid_pid": str|null, "usb_serial": str|null, "variant": str|null},
+  "kind": "fpga"|"other"|"unknown", "kind_reason": str, "clients": int,
+  "uptime_s": int, "version": str}`. `vid_pid` is the board's USB
+  `idVendor:idProduct` and `usb_serial` its USB serial number (the value on
+  the board's label), both read from sysfs (`null` if the device is not a USB
+  tty). `variant` and `kind` are what the boot check's report says the board
+  is; `kind_reason` says where that came from, or why it is not known.
 - On shutdown every open `/serial` socket is closed with code 1001
   (`server shutdown`); on board loss with 1011 (`board disconnected`).
-- Discovers which board it is from its hostname (`pi-sw<switch>-p<port>`) and
-  `/etc/fpgas-online/tt-boards.yaml` (baked into the Pi NFS root by
-  fpgas.online-infra). Unknown hostname ⇒ plain `asic` bridge.
+- **What the board is comes from the board, never from where it is plugged
+  in.** No file says which Pi or which switch port carries which board, so a
+  board moved to another port keeps everything it had. The daemon reads the
+  USB serial of the device behind `/dev/ttboard` and looks that board up in the
+  boot check's report on the same Pi (`--report`, default
+  `/run/fpgas-online/verify.json`, written by fpgas-verify from
+  [fpgas.online-test-designs](https://github.com/fpgas-online/fpgas.online-test-designs)).
+  A board the report calls `tt-fpga` is `kind: fpga`; another Tiny Tapeout
+  variant is `other`; a board the report does not name (no boot check yet this
+  boot, a board plugged in since, a board the check does not know) is
+  `unknown`. Both are read at each request, so a boot check that finishes
+  after the daemon has started needs no restart. The daemon never asks the
+  board what it is: the boot check does that, and a second prober would get in
+  a visitor's way. The serial bridge works whatever the kind.
 - On `kind: fpga` boards, three extra routes list, load and accept designs.
   **Nothing writes to the demo board's filesystem.** Every design is a file on
   the Pi: the packaged demos (`--demos-dir`) and visitors' uploads
@@ -42,8 +54,10 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   | `POST /designs/{name}/enable` | body `{"clock_hz": int}` (optional) → `{"enabled": name, "clock_hz": int\|null}`; if the board's SDK is not running, does what the Commander does in that case (a soft reset from the friendly REPL: Ctrl-C twice, Ctrl-B, Ctrl-D, which runs the board's own `main.py`), then sends the bitstream and loads it; bounded to a 25 s overall REPL deadline (below the site proxy's own 30 s/45 s read timeouts, so a stuck load still gets a clean 502 from this daemon instead of the client seeing a raw connection reset) |
   | `POST /bitstream` | multipart form (`name`, `file`) → `201 {"name", "size", "evicted": [str, ...]}`; kept on the Pi, the board is not involved; rejects names that collide with a demo, non-`[a-z0-9_]{1,40}` names, oversize (>256 KiB) or non-iCE40 files (400); removes the oldest uploads first so at most 16 remain |
 
-  Non-fpga boards get `404 {"error": "not an fpga board", "detail": ""}` on
-  all three. Other error shapes (`{"error": str, "detail": str}`): `503 board
+  A board the report says is not an FPGA demo board gets `404 {"error": "not
+  an fpga board", "detail": why}` on all three, and one the report does not
+  name yet gets `503 {"error": "board not identified yet", "detail": why}`.
+  Other error shapes (`{"error": str, "detail": str}`): `503 board
   not present`, `409 another task is running` (or a demo-name collision on
   upload), `404 no such design` (including a name that could never be
   valid — rejected before the board is asked), `502 REPL task failed`
@@ -90,7 +104,7 @@ Listens on `0.0.0.0:8765`; only the gateway can reach it (per-port VLANs).
 uv sync
 uv run pytest
 uv run ruff check .
-uv run fpgas-tt --device /dev/ttyACM0 --boards tests/data/tt-boards.yaml --hostname pi-sw1-p6
+uv run fpgas-tt --device /dev/ttyACM0 --report my-verify.json
 ```
 
 Tests use a pseudo-terminal as a fake board; no hardware needed.

@@ -167,7 +167,6 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "pyserial-asyncio" },
-    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -175,6 +174,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-aiohttp" },
     { name = "pytest-asyncio" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 
@@ -182,7 +182,6 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.8" },
     { name = "pyserial-asyncio", specifier = ">=0.6" },
-    { name = "pyyaml", specifier = ">=6" },
 ]
 
 [package.metadata.requires-dev]
@@ -190,6 +189,7 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-aiohttp", specifier = ">=1.0" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 
