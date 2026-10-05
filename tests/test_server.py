@@ -6,10 +6,10 @@ from pathlib import Path
 import aiohttp
 import pytest
 
-from fpgas_tt import __version__, designs
+from fpgas_tt import __version__, designs, identity
 from fpgas_tt.bridge import Bridge
-from fpgas_tt.config import BoardConfig
 from fpgas_tt.designs import ICE40_PREAMBLE
+from fpgas_tt.identity import Identity
 from fpgas_tt.server import (
     MULTIPART_NAME_MAX_BYTES,
     build_parser,
@@ -17,7 +17,16 @@ from fpgas_tt.server import (
     main,
 )
 
-CFG = BoardConfig(slug="tt06", kind="asic", switch=1, port=6, hostname="pi-sw1-p6")
+SERIAL = "a2961e5cac65b25f"
+# What identity.identify() gives for a board the boot check's report does not name, one that told the check it
+# carries the FPGA breakout, and one that told it it carries a chip.
+NOT_NAMED = Identity(identity.UNKNOWN, SERIAL, None, "verify.json does not name board " + SERIAL)
+IS_FPGA = Identity(identity.FPGA, SERIAL, "fpga", "verify.json says board " + SERIAL + " carries fpga")
+IS_OTHER = Identity(identity.OTHER, SERIAL, "asic", "verify.json says board " + SERIAL + " carries asic")
+
+
+def fpga_app(bridge, **kwargs):
+    return create_app(bridge, identify=lambda: IS_FPGA, **kwargs)
 
 
 async def wait_for(predicate, timeout=2.0):
@@ -40,7 +49,7 @@ async def bridge(fake_board):
 
 @pytest.fixture
 async def client(aiohttp_client, bridge):
-    return await aiohttp_client(create_app(bridge, CFG))
+    return await aiohttp_client(create_app(bridge, identify=lambda: NOT_NAMED))
 
 
 async def test_health_reports_board_and_identity(client):
@@ -49,13 +58,15 @@ async def test_health_reports_board_and_identity(client):
     body = await resp.json()
     assert body["board"]["present"] is True
     assert body["board"]["device"].endswith("ttboard")
-    assert body["kind"] == "asic"
-    assert body["slug"] == "tt06"
-    assert body["switch"] == 1 and body["port"] == 6
+    assert body["kind"] == "unknown"
+    assert body["kind_reason"] == NOT_NAMED.reason
+    assert body["board"]["usb_serial"] == SERIAL
+    assert body["board"]["chip"] is None
+    # nothing says where the board is plugged in
+    assert not {"slug", "switch", "port", "hostname"} & set(body)
     assert body["board"]["vid_pid"] is None  # a pty has no USB identity
     assert body["clients"] == 0
     assert body["version"] == __version__
-    assert body["config_error"] is None
     assert isinstance(body["uptime_s"], int)
 
 
@@ -63,7 +74,7 @@ async def test_health_when_board_absent(aiohttp_client, tmp_path):
     bridge = Bridge(str(tmp_path / "missing"), reopen_interval=0.05)
     await bridge.start()
     try:
-        c = await aiohttp_client(create_app(bridge, CFG))
+        c = await aiohttp_client(create_app(bridge, identify=lambda: NOT_NAMED))
         body = await (await c.get("/health")).json()
         assert body["board"]["present"] is False
     finally:
@@ -117,7 +128,7 @@ async def test_serial_ws_write_when_board_absent_reports_error(aiohttp_client, t
     bridge = Bridge(str(tmp_path / "missing"), reopen_interval=0.05)
     await bridge.start()
     try:
-        c = await aiohttp_client(create_app(bridge, CFG))
+        c = await aiohttp_client(create_app(bridge, identify=lambda: NOT_NAMED))
         async with c.ws_connect("/serial") as ws:
             first = json.loads((await ws.receive(timeout=2)).data)
             assert first["present"] is False
@@ -128,8 +139,18 @@ async def test_serial_ws_write_when_board_absent_reports_error(aiohttp_client, t
         await bridge.stop()
 
 
-def test_main_parses_args_and_discovers(monkeypatch, tmp_path):
-    """main() wires argv → discover() → create_app → run_app; we stub run_app."""
+FPGA_BOARD = {"board": "tt", "variant": "tt-fpga", "found": {"serial": SERIAL},
+              "identity": {"usb_serial": SERIAL, "chip": "fpga"}}
+
+
+def _report(tmp_path, boards):
+    path = tmp_path / "verify.json"
+    path.write_text(json.dumps({"schema_version": 2, "result": "pass", "boards": boards}))
+    return path
+
+
+def test_main_takes_the_kind_from_the_report(monkeypatch, tmp_path, caplog):
+    """main() wires argv → create_app → run_app (stubbed); the app asks the report what the board is."""
     captured = {}
 
     def fake_run_app(app, **kwargs):
@@ -137,14 +158,28 @@ def test_main_parses_args_and_discovers(monkeypatch, tmp_path):
         captured["kwargs"] = kwargs
 
     monkeypatch.setattr("fpgas_tt.server.web.run_app", fake_run_app)
-    boards = tmp_path / "tt-boards.yaml"
-    boards.write_text("tt_boards:\n  - {slug: fpga-1, port: 12, kind: fpga}\n")
-    rc = main(["--device", "/dev/null", "--boards", str(boards), "--hostname", "pi-sw1-p12", "--port", "9999"])
+    monkeypatch.setattr(identity, "usb_serial_for_tty", lambda device: SERIAL)
+    report = _report(tmp_path, [FPGA_BOARD])
+    with caplog.at_level("INFO", logger="fpgas_tt.server"):
+        rc = main(["--device", "/dev/null", "--report", str(report), "--port", "9999"])
     assert rc == 0
+    assert "kind=fpga" in caplog.text
     assert captured["kwargs"]["port"] == 9999
     assert captured["kwargs"]["host"] == "0.0.0.0"
-    assert captured["app"]["config"].slug == "fpga-1"
+    assert captured["kwargs"]["shutdown_timeout"] == 5.0
+    assert captured["kwargs"]["access_log"] is None
     assert captured["app"]["bridge"].device == "/dev/null"
+    assert captured["app"]["identify"]().kind == "fpga"
+    # the report is read again at each request: the boot check may write it after the daemon starts
+    report.write_text(json.dumps({"boards": []}))
+    assert captured["app"]["identify"]().kind == "unknown"
+
+
+def test_no_option_names_a_port_or_a_board_map():
+    parser = build_parser()
+    for gone in ("--boards", "--hostname"):
+        with pytest.raises(SystemExit):
+            parser.parse_args([gone, "x"])
 
 
 async def test_websockets_closed_on_server_shutdown(client, bridge):
@@ -162,34 +197,6 @@ async def test_websockets_closed_on_server_shutdown(client, bridge):
     await wait_for(lambda: bridge.clients == 0)
 
 
-async def test_health_reports_config_error(aiohttp_client, bridge):
-    c = await aiohttp_client(create_app(bridge, CFG, config_error="tt-boards.yaml: boom"))
-    body = await (await c.get("/health")).json()
-    assert body["config_error"] == "tt-boards.yaml: boom"
-
-
-def test_main_falls_back_when_boards_file_is_invalid(monkeypatch, tmp_path, caplog):
-    """A broken tt-boards.yaml must not put the unit in a restart loop."""
-    captured = {}
-
-    def fake_run_app(app, **kwargs):
-        captured["app"] = app
-        captured["kwargs"] = kwargs
-
-    monkeypatch.setattr("fpgas_tt.server.web.run_app", fake_run_app)
-    boards = tmp_path / "tt-boards.yaml"
-    boards.write_text("tt_boards:\n  - {slug: [oops\n")  # malformed YAML
-    with caplog.at_level("ERROR", logger="fpgas_tt.server"):
-        rc = main(["--device", "/dev/null", "--boards", str(boards), "--hostname", "pi-sw1-p6"])
-    assert rc == 0
-    assert "falling back" in caplog.text
-    app = captured["app"]
-    assert app["config"] == BoardConfig(slug="pi-sw1-p6", kind="asic", switch=1, port=6, hostname="pi-sw1-p6")
-    assert app["config_error"]
-    assert captured["kwargs"]["shutdown_timeout"] == 5.0
-    assert captured["kwargs"]["access_log"] is None
-
-
 def test_log_level_is_restricted():
     parser = build_parser()
     assert parser.parse_args(["--log-level", "DEBUG"]).log_level == "DEBUG"
@@ -198,21 +205,43 @@ def test_log_level_is_restricted():
 
 
 DEMOS = Path(__file__).parent / "data" / "demos"
-FPGA_CFG = BoardConfig(slug="fpga-1", kind="fpga", switch=2, port=33, hostname="pi-sw2-p33")
 
 
 @pytest.fixture
 async def fpga_client(aiohttp_client, bridge, fake_repl, tmp_path):
     # the designs are the Pi's: the packaged demos, and uploads in a directory of this test's own
-    return await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=DEMOS, uploads_dir=tmp_path / "pi-uploads"))
+    return await aiohttp_client(fpga_app(bridge, demos_dir=DEMOS, uploads_dir=tmp_path / "pi-uploads"))
 
 
-async def test_fpga_routes_404_on_asic_board(client):
-    routes = (("GET", "/designs"), ("POST", "/designs/x/enable"), ("POST", "/bitstream"))
-    for method, path in routes:
+ROUTES = (("GET", "/designs"), ("POST", "/designs/x/enable"), ("POST", "/bitstream"))
+
+
+async def test_fpga_routes_503_until_the_board_is_identified(client):
+    for method, path in ROUTES:
         resp = await client.request(method, path)
+        assert resp.status == 503
+        assert await resp.json() == {"error": "board not identified yet", "detail": NOT_NAMED.reason}
+
+
+async def test_fpga_routes_404_on_a_board_that_is_not_an_fpga_board(aiohttp_client, bridge):
+    c = await aiohttp_client(create_app(bridge, identify=lambda: IS_OTHER))
+    for method, path in ROUTES:
+        resp = await c.request(method, path)
         assert resp.status == 404
-        assert (await resp.json())["error"] == "not an fpga board"
+        assert await resp.json() == {"error": "not an fpga board", "detail": IS_OTHER.reason}
+
+
+async def test_the_kind_follows_the_report_without_a_restart(aiohttp_client, bridge, fake_repl, tmp_path, monkeypatch):
+    """The boot check finishes after the daemon has started: the design routes work from then on."""
+    monkeypatch.setattr(identity, "usb_serial_for_tty", lambda device: SERIAL)
+    report = tmp_path / "verify.json"
+    c = await aiohttp_client(create_app(bridge, report=report, demos_dir=DEMOS, uploads_dir=tmp_path / "up"))
+    assert (await c.get("/designs")).status == 503
+    assert (await (await c.get("/health")).json())["kind"] == "unknown"
+    _report(tmp_path, [FPGA_BOARD])
+    assert (await c.get("/designs")).status == 200
+    health = await (await c.get("/health")).json()
+    assert health["kind"] == "fpga" and health["board"]["chip"] == "fpga"
 
 
 async def test_fpga_only_guard_is_checked_by_identity_not_truthiness(client, monkeypatch):
@@ -327,7 +356,7 @@ async def test_board_absent_gives_503(aiohttp_client, tmp_path):
     bridge = Bridge(str(tmp_path / "missing"), reopen_interval=0.05)
     await bridge.start()
     try:
-        c = await aiohttp_client(create_app(bridge, FPGA_CFG, demos_dir=tmp_path, uploads_dir=tmp_path / "up"))
+        c = await aiohttp_client(fpga_app(bridge, demos_dir=tmp_path, uploads_dir=tmp_path / "up"))
         resp = await c.get("/designs")
         assert resp.status == 503
         assert (await resp.json())["error"] == "board not present"
@@ -444,3 +473,20 @@ async def test_enable_rejects_invalid_clock_hz(fpga_client, clock_hz):
     resp = await fpga_client.post("/designs/some_name/enable", json={"clock_hz": clock_hz})
     assert resp.status == 400
     assert "clock_hz" in (await resp.json())["error"]
+
+
+async def test_nothing_stubbed_sysfs_and_a_real_report(aiohttp_client, bridge, fake_repl, tmp_path, monkeypatch):
+    """/health through the real identify(): a sysfs tree for the board's tty, and a report read from a Pi."""
+    from fpgas_tt import usbinfo
+    from tests.test_usbinfo import _fake_sysfs
+
+    tty = Path(bridge.device).resolve().name
+    root = _fake_sysfs(tmp_path, tty=tty, pid="0005", serial=SERIAL)
+    monkeypatch.setattr(usbinfo, "SYSFS_TTY_ROOT", str(root))
+    real = Path(__file__).parent / "data" / "verify-tt-fpga-2026-10-05.json"
+    c = await aiohttp_client(create_app(bridge, report=real, demos_dir=DEMOS, uploads_dir=tmp_path / "up"))
+    body = await (await c.get("/health")).json()
+    assert body["board"] == {"present": True, "device": bridge.device, "vid_pid": "2e8a:0005",
+                             "usb_serial": SERIAL, "chip": "fpga"}
+    assert body["kind"] == "fpga"
+    assert (await c.get("/designs")).status == 200

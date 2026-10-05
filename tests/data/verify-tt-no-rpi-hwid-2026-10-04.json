@@ -1,0 +1,61 @@
+{
+ "schema_version": 2,
+ "result": "fail",
+ "checked_at": "2026-10-04T00:40:29+00:00",
+ "boards": [
+  {
+   "board": "tt",
+   "variant": "tt-fpga",
+   "found": {
+    "variant": "tt-fpga",
+    "usb": "1-1.2",
+    "serial": "4df39a7a6856f86f"
+   },
+   "tests": [
+    {
+     "test": "pin-id",
+     "bitstream": "pmod-pin-id-tt-fpga/tt_fpga_platform.bin",
+     "result": "fail",
+     "reason": "the test exited 1"
+    },
+    {
+     "test": "uart",
+     "bitstream": "uart-test-tt-fpga/tt_fpga_platform.bin",
+     "result": "pass"
+    },
+    {
+     "test": "spiflash",
+     "bitstream": "spiflash-test-tt-fpga/tt_fpga_platform.bin",
+     "result": "fail",
+     "reason": "the test exited 1",
+     "flash_jedec": "0x000000"
+    }
+   ],
+   "bitstreams": "0.0.post1013",
+   "identity": {
+    "board": "tt",
+    "kind": "tt",
+    "variant": "tt-fpga",
+    "serial": "4df39a7a6856f86f",
+    "usb": "1-1.2",
+    "usb_serial": "4df39a7a6856f86f",
+    "tinytapeout_note": "not read: rpi-hwid is not installed (python3-rpi-hwid, or `uv tool install rpi-hwid`)"
+   },
+   "flash_note": "not read: every verify rewrites the bitstream on the RP2350",
+   "state": {
+    "variant": "tt-fpga",
+    "serial": "4df39a7a6856f86f",
+    "flash_jedec": "0x000000"
+   },
+   "result": "fail",
+   "reason": "pin-id fail: the test exited 1; spiflash fail: the test exited 1"
+  }
+ ],
+ "mode": "auto",
+ "configured_by": "/usr/share/fpgas-online/verify/mode.d/fpgas-online-multi-board.ini",
+ "chosen_by": "auto: USB/PCI IDs",
+ "state": {
+  "file": "/var/lib/fpgas-online/verify-state.json",
+  "recorded": "first run"
+ }
+}

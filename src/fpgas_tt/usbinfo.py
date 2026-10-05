@@ -1,8 +1,10 @@
 """USB identity of a tty, read from sysfs.
 
 ``/health`` reports it so the site can tell "no board" apart from "some other
-USB serial device answered to /dev/ttboard". Best effort only: anything
-missing or unreadable is reported as ``None``, never as an error.
+USB serial device answered to /dev/ttboard", and the board's USB serial number
+is how the daemon finds its board in the boot check's report (identity.py).
+Best effort only: anything missing or unreadable is reported as ``None``,
+never as an error.
 """
 
 from __future__ import annotations
@@ -20,16 +22,17 @@ SYSFS_TTY_ROOT = "/sys/class/tty"
 MAX_PARENT_LEVELS = 3
 
 
-def _read_hex(path: Path) -> str | None:
+def _read(path: Path) -> str | None:
     try:
-        return path.read_text().strip().lower() or None
+        return path.read_text().strip() or None
     except OSError as exc:
         log.debug("usbinfo: cannot read %s: %s", path, exc)
         return None
 
 
-def vid_pid_for_tty(device_path: str) -> str | None:
-    """``/dev/ttboard`` → ``"2e8a:0005"``, or ``None`` if it is not a USB tty.
+def _usb_device(device_path: str) -> tuple[Path, str, str] | None:
+    """The sysfs directory of the USB device behind a tty, with its vendor and
+    product ids; ``None`` if the tty is not a USB one.
 
     *device_path* may be a udev symlink; it is resolved first.
     """
@@ -47,9 +50,28 @@ def vid_pid_for_tty(device_path: str) -> str | None:
         return None
     for _ in range(MAX_PARENT_LEVELS):
         node = node.parent
-        vid = _read_hex(node / "idVendor")
-        pid = _read_hex(node / "idProduct")
+        vid = _read(node / "idVendor")
+        pid = _read(node / "idProduct")
         if vid and pid:
-            return f"{vid}:{pid}"
+            return node, vid.lower(), pid.lower()
     log.debug("usbinfo: no idVendor/idProduct above %s", link)
     return None
+
+
+def vid_pid_for_tty(device_path: str) -> str | None:
+    """``/dev/ttboard`` → ``"2e8a:0005"``, or ``None`` if it is not a USB tty."""
+    found = _usb_device(device_path)
+    if found is None:
+        return None
+    _, vid, pid = found
+    return f"{vid}:{pid}"
+
+
+def usb_serial_for_tty(device_path: str) -> str | None:
+    """``/dev/ttboard`` → the USB serial number of the device behind it (the
+    value on the board's label), or ``None`` if it is not a USB tty or the
+    device gives none."""
+    found = _usb_device(device_path)
+    if found is None:
+        return None
+    return _read(found[0] / "serial")

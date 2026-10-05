@@ -1,7 +1,7 @@
 """HTTP/WebSocket front end for the bridge, and the ``fpgas-tt`` CLI.
 
 Endpoints:
-  GET  /health                  JSON status used by the site's status pill
+  GET  /health                  JSON status used by the site's status pill; says what the board is
   WS   /serial                  the bridge: binary frames <-> board bytes; text
                                  frames from the server are JSON events; text
                                  frames from the client are written to the board
@@ -13,8 +13,10 @@ Endpoints:
 Nothing here writes to the demo board's filesystem: designs are files on the Pi (the packaged demos, and
 uploads in --uploads-dir), and loading one streams it into the FPGA through the board's memory (designs.py).
 
-The three design/bitstream routes return 404
-``{"error": "not an fpga board", "detail": ""}`` on non-fpga boards, and map
+What the board is comes from the board, never from where it is plugged in (identity.py): its USB serial and
+the boot check's report on this Pi, read at each request. The three design/bitstream routes return 404
+``{"error": "not an fpga board", "detail": why}`` on a board that told the check it carries a chip, 503
+``{"error": "board not identified yet", "detail": why}`` on one the report does not say that for yet, and map
 ``ReplRunner``/``designs`` exceptions onto the wire contract: 503 board not
 present, 409 another task is running (or a demo-name collision on upload),
 404 no such design (including a name POSTed to /designs/{name}/enable that
@@ -31,16 +33,16 @@ import asyncio
 import contextlib
 import logging
 import re
-import socket
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from fpgas_tt import __version__, designs
+from fpgas_tt import __version__, designs, identity
 from fpgas_tt.bridge import BoardNotPresent, Bridge
-from fpgas_tt.config import BoardConfig, discover, parse_hostname
 from fpgas_tt.designs import DEMOS_DIR_DEFAULT, UPLOADS_DIR_DEFAULT, DesignNotFound, ValidationError
+from fpgas_tt.identity import REPORT_DEFAULT, Identity
 from fpgas_tt.repl import ReplBusy, ReplError, ReplNoBoard, ReplRunner
 from fpgas_tt.usbinfo import vid_pid_for_tty
 
@@ -74,10 +76,10 @@ _UNSAFE_DETAIL_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|[^\x20-\x7e\n]")
 
 def create_app(
     bridge: Bridge,
-    config: BoardConfig,
     *,
     version: str = __version__,
-    config_error: str | None = None,
+    report: Path | str = REPORT_DEFAULT,
+    identify: Callable[[], Identity] | None = None,
     demos_dir: Path | str = DEMOS_DIR_DEFAULT,
     uploads_dir: Path | str = UPLOADS_DIR_DEFAULT,
 ) -> web.Application:
@@ -86,9 +88,10 @@ def create_app(
     # belt-and-braces check for 3.8.4.
     app = web.Application(client_max_size=MULTIPART_MAX_BYTES)
     app["bridge"] = bridge
-    app["config"] = config
+    # Asked at each request, never kept: the boot check may finish after this daemon starts, and a board may
+    # be swapped under it. *identify* is for the tests; the daemon reads the board's USB serial and *report*.
+    app["identify"] = identify or (lambda: identity.identify(bridge.device, report))
     app["version"] = version
-    app["config_error"] = config_error
     app["started"] = time.monotonic()
     app["websockets"] = set()
     app["demos_dir"] = Path(demos_dir)
@@ -121,9 +124,12 @@ def _json_error(status: int, error: str, detail: str = "") -> web.Response:
 
 
 def _fpga_only(request: web.Request) -> web.Response | None:
-    if request.app["config"].kind != "fpga":
-        return _json_error(404, "not an fpga board")
-    return None
+    who: Identity = request.app["identify"]()
+    if who.kind == identity.FPGA:
+        return None
+    if who.kind == identity.UNKNOWN:
+        return _json_error(503, "board not identified yet", who.reason)
+    return _json_error(404, "not an fpga board", who.reason)
 
 
 def _sanitize_detail(text: str) -> str:
@@ -258,23 +264,21 @@ async def bitstream_upload(request: web.Request) -> web.Response:
 
 async def health(request: web.Request) -> web.Response:
     bridge: Bridge = request.app["bridge"]
-    config: BoardConfig = request.app["config"]
+    who: Identity = request.app["identify"]()
     return web.json_response(
         {
             "board": {
                 "present": bridge.present,
                 "device": bridge.device,
                 "vid_pid": vid_pid_for_tty(bridge.device),
+                "usb_serial": who.usb_serial,
+                "chip": who.chip,
             },
-            "kind": config.kind,
-            "slug": config.slug,
-            "switch": config.switch,
-            "port": config.port,
-            "hostname": config.hostname,
+            "kind": who.kind,
+            "kind_reason": who.reason,
             "clients": bridge.clients,
             "uptime_s": int(time.monotonic() - request.app["started"]),
             "version": request.app["version"],
-            "config_error": request.app["config_error"],
         }
     )
 
@@ -349,15 +353,10 @@ async def serial_ws(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
-def _short_hostname() -> str:
-    return socket.gethostname().split(".")[0]
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fpgas-tt", description="Tiny Tapeout demo-board bridge daemon")
     p.add_argument("--device", default="/dev/ttboard", help="serial device (udev symlink) of the demo board")
-    p.add_argument("--boards", default="/etc/fpgas-online/tt-boards.yaml", help="site-wide board map (YAML)")
-    p.add_argument("--hostname", default=_short_hostname(), help="override this Pi's short hostname")
+    p.add_argument("--report", default=str(REPORT_DEFAULT), help="the boot check's report on this Pi (JSON)")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--baudrate", type=int, default=115200)
@@ -371,23 +370,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    config_error: str | None = None
-    try:
-        config = discover(args.hostname, args.boards)
-    except ValueError as exc:
-        # A broken board map must not put the unit in a Restart=always loop:
-        # serve the port as a plain asic bridge and report why in /health.
-        log.error("fpgas-tt: invalid boards file %s: %s — falling back to plain asic bridge", args.boards, exc)
-        config_error = str(exc) or None
-        sp = parse_hostname(args.hostname)
-        switch, port = sp if sp else (None, None)
-        config = BoardConfig(slug=args.hostname, kind="asic", switch=switch, port=port, hostname=args.hostname)
-
-    log.info("fpgas-tt %s: %s kind=%s slug=%s device=%s", __version__, config.hostname, config.kind, config.slug,
-             args.device)
+    who = identity.identify(args.device, args.report)
+    log.info("fpgas-tt %s: device=%s kind=%s (%s)", __version__, args.device, who.kind, who.reason)
 
     bridge = Bridge(args.device, baudrate=args.baudrate)
-    app = create_app(bridge, config, config_error=config_error, demos_dir=args.demos_dir, uploads_dir=args.uploads_dir)
+    app = create_app(bridge, report=args.report, demos_dir=args.demos_dir, uploads_dir=args.uploads_dir)
 
     async def on_startup(_app: web.Application) -> None:
         await bridge.start()

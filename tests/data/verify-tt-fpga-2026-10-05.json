@@ -1,0 +1,56 @@
+{
+ "schema_version": 2,
+ "result": "pass",
+ "checked_at": "2026-10-05T00:35:22+00:00",
+ "mode": "auto",
+ "configured_by": "/usr/share/fpgas-online/verify/mode.d/fpgas-online-multi-board.ini",
+ "chosen_by": "auto: USB/PCI IDs",
+ "state": {
+  "file": "/var/lib/fpgas-online/verify-state.json",
+  "recorded": "first run"
+ },
+ "boards": [
+  {
+   "board": "tt",
+   "variant": "tt-fpga",
+   "found": {
+    "variant": "tt-fpga",
+    "usb": "1-1.2",
+    "serial": "a2961e5cac65b25f"
+   },
+   "bitstreams": "0.0.post1094",
+   "identity": {
+    "board": "tt",
+    "kind": "tt",
+    "variant": "tt-fpga",
+    "serial": "a2961e5cac65b25f",
+    "usb": "1-1.2",
+    "usb_serial": "a2961e5cac65b25f",
+    "mcu": "RP2350",
+    "shuttle": null,
+    "chip": "fpga",
+    "repo": null,
+    "commit": null,
+    "demoboard": "TTDBv3 [3.2]",
+    "demoboard_version": null,
+    "sdk": "3.1.0"
+   },
+   "flash_note": "none: the FPGA breakout has no SPI flash; the RP2350 loads each bitstream from the Pi",
+   "state": {
+    "variant": "tt-fpga",
+    "serial": "a2961e5cac65b25f"
+   },
+   "result": "pass",
+   "tests": [
+    {
+     "test": "pin-id",
+     "result": "pass"
+    },
+    {
+     "test": "uart",
+     "result": "pass"
+    }
+   ]
+  }
+ ]
+}

@@ -11,7 +11,9 @@ User=pi
 SupplementaryGroups=dialout
 # Visitors' uploads are kept here, on the Pi (/var/lib/fpgas-tt/uploads): never on the demo board.
 StateDirectory=fpgas-tt
-ExecStart=/usr/bin/fpgas-tt --device /dev/ttboard --boards /etc/fpgas-online/tt-boards.yaml
+# What the board is comes from the board (its USB serial, and the boot check's report in /run/fpgas-online):
+# no option says which Pi or which switch port this is.
+ExecStart=/usr/bin/fpgas-tt --device /dev/ttboard
 Restart=always
 RestartSec=1
 
