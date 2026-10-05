@@ -90,7 +90,8 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   does not apply the `ui_in = 1` that makes it count, so the display is a
   still pattern. When no serial client is connected and no client, Run or
   upload has happened for `--idle-after` seconds (default 60), the daemon
-  asks the board once what it has loaded, and if that is the SDK's start
+  asks the board once what it has loaded (once more when
+  `--idle-replace-after` is reached), and if that is the SDK's start
   state it streams the boot check's design again (`--idle-design`, default
   `/usr/share/fpgas-online/tt-fpga/bitstreams/tt-display-tt-fpga/tt_fpga_platform.bin`
   from `fpgas-online-tt-fpga-bitstreams`; empty for no idle display), the way
@@ -99,6 +100,14 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   clock, reset and inputs.
   - Nothing is typed at the board while a serial client is connected: while a
     client is there the board is the visitor's, a still display included.
+  - A serial client that connects while the daemon is asking the board or
+    streaming the idle design is accepted and held, not bridged, until the
+    daemon has finished or given up (it gives up at once if it was only
+    asking; a load takes a few seconds). So a visitor never shares the REPL
+    with the daemon's own load and never sees its bytes. A Run or a design
+    list that arrives then waits the same way.
+  - A board that was unplugged, reset or power-cycled starts a new quiet
+    time; so does a load that failed (ten minutes).
   - A board without the SDK's `tt` object is left alone: that is how the boot
     check leaves it, with the moving design already running.
   - A design a visitor loaded is never replaced, unless
@@ -109,12 +118,11 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
     touched.
   - `/health` says what happened, in `idle_display.state`: `waiting`,
     `in use`, `loaded`, `left: <a visitor's design>`, `left: the SDK is not
-    running`, `not an fpga board`, `file missing`, `file is not an iCE40
-    bitstream`, or `failed: <why>`. A missing file is also logged once; the
-    file is looked for again at each quiet time, so a root that gains it
-    needs no restart.
-  - While the idle design is being streamed (a few seconds) a Run answers
-    `409 another task is running`.
+    running`, `board not present`, `not an fpga board`, `file missing`,
+    `file is not an iCE40 bitstream`, or `failed: <why>`. A design name that
+    is not one a design here could have is said as `a design`. A missing
+    file is also logged once; the file is looked for again at each quiet
+    time, so a root that gains it needs no restart.
 - Until 2026-10 the daemon copied every demo and every upload to the board's
   `/bitstreams` and loaded from there. Boards from that time still hold those
   files; the daemon neither reads nor removes them.

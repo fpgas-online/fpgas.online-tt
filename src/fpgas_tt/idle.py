@@ -25,8 +25,14 @@ The rules:
   design. A design a visitor loaded is replaced only after ``replace_after`` quiet seconds, and that is off
   unless asked for: the daemon cannot see a visitor who is watching the camera or working on the Pi, and
   taking their design away unannounced would end their session without the page's warning.
-* The board is asked what it has loaded once per quiet time, not polled: asking interrupts whatever program
-  was left running at the prompt.
+* The board is asked what it has loaded once per quiet time (once more when ``replace_after`` is reached), not
+  polled: asking interrupts whatever program was left running at the prompt.
+* While the daemon is asking or streaming, the board is taken (``Taken``): a serial client that connects then
+  is accepted and held, not bridged, until the daemon has finished or given up, and a Run waits the same way.
+  So a visitor never shares the REPL with the daemon's own load and never sees its bytes. A client that
+  arrives while the board is being asked makes the daemon give up before it streams anything.
+* A board that was unplugged, reset or power-cycled starts a new quiet time, as does a load that failed (a
+  longer one), so a board that comes back in the SDK's start state gets the idle design again.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from pathlib import Path
 
@@ -54,6 +61,8 @@ IDLE_AFTER_DEFAULT = 60.0
 # What the SDK loads at every start (src/config.ini at v3.1.0: `project = tt_um_factory_test`).
 SDK_START_DESIGN = "tt_um_factory_test"
 POLL = 5.0
+# After a load that failed, the board is left alone this long before the next try.
+FAILED_WAIT = 600.0
 
 STATE_CODE = (
     "import json\n"
@@ -71,6 +80,38 @@ class Activity:
 
     def touch(self) -> None:
         self.last = time.monotonic()
+
+
+class Taken:
+    """The board is the daemon's for a moment (the idle display is asking it, or streaming into it). Whoever
+    else wants the board waits in `free()` first."""
+
+    def __init__(self) -> None:
+        self._free: asyncio.Event | None = None
+
+    @property
+    def taken(self) -> bool:
+        return self._free is not None
+
+    def take(self) -> None:
+        self._free = asyncio.Event()
+
+    def release(self) -> None:
+        if self._free is not None:
+            self._free.set()
+            self._free = None
+
+    async def free(self) -> None:
+        while self._free is not None:
+            await self._free.wait()
+
+
+def named(enabled) -> str | None:
+    """The name of the loaded design as the board gave it, if it is one this daemon would say aloud. A visitor
+    at the REPL can call a design anything, and this goes into /health and the log."""
+    if enabled is None:
+        return None
+    return enabled if isinstance(enabled, str) and designs.NAME_RE.match(enabled) else "a design"
 
 
 def wanted(state: dict, quiet: float, after: float, replace_after: float | None) -> bool:
@@ -91,15 +132,20 @@ class IdleDisplay:
         after: float = IDLE_AFTER_DEFAULT,
         replace_after: float | None = None,
     ) -> None:
+        if not (math.isfinite(after) and after > 0):
+            raise ValueError("the quiet time before the idle display must be a number of seconds above 0")
+        if replace_after is not None and not (math.isfinite(replace_after) and replace_after >= after):
+            raise ValueError("a visitor's design can be replaced no sooner than the quiet time of the idle display")
         self._app = app
         self.design = Path(design)
         self.after = after
         self.replace_after = replace_after
-        # What /health says: "waiting", "in use", "not an fpga board", "file missing", "file is not an iCE40
-        # bitstream", "left: <the design a visitor loaded>", "left: the SDK is not running", "loaded",
-        # "failed: <why>".
+        # What /health says: "waiting", "in use", "board not present", "not an fpga board", "file missing",
+        # "file is not an iCE40 bitstream", "left: <the design a visitor loaded>", "left: the SDK is not
+        # running", "loaded", "failed: <why>".
         self.state = "waiting"
         self._asked: tuple[float, int] | None = None  # the quiet time, and its stage, the board was asked in
+        self._opens = app["bridge"].opens  # the board, as last seen: it comes back as another one
         self._file_warned = False
         self._task: asyncio.Task | None = None
 
@@ -126,35 +172,61 @@ class IdleDisplay:
             log.warning("idle display: %s (%s); the display of an unused board is left as it is", state, detail)
             self._file_warned = True
 
-    async def step(self) -> str:
-        """Look once, and stream the idle design if this is the moment for it. Returns `self.state`."""
+    def _look(self) -> tuple[float, int] | None:
+        """Whether this is a moment to ask the board: the quiet time and its stage, or None with `self.state`
+        saying why not. Nothing is awaited here, so what it saw still holds when it returns."""
         app = self._app
-        if app["websockets"] or app["repl"].busy or not app["bridge"].present:
+        bridge = app["bridge"]
+        if bridge.opens != self._opens:  # unplugged, reset or power-cycled: whatever it had loaded is gone
+            self._opens = bridge.opens
+            self._asked = None
+            app["activity"].touch()
+        if not bridge.present:
+            self.state = "board not present"
+            return None
+        if app["websockets"] or app["repl"].busy or app["taken"].taken:
             self.state = "in use"
-            return self.state
+            return None
         if app["identify"]().kind != identity.FPGA:
             self.state = "not an fpga board"
-            return self.state
+            return None
         stamp = app["activity"].last
         quiet = time.monotonic() - stamp
         stage = 2 if self.replace_after is not None and quiet >= self.replace_after else 1 if quiet >= self.after else 0
         if self._asked is not None and self._asked[0] == stamp and self._asked[1] >= stage:
-            return self.state  # already settled for this quiet time
+            return None  # already settled for this quiet time: the state stays what that left
         if stage == 0:
-            self.state = "waiting"
+            if not self.state.startswith("failed: "):  # a failed load is said until it is tried again
+                self.state = "waiting"
+            return None
+        return stamp, stage
+
+    async def step(self) -> str:
+        """Look once, and stream the idle design if this is the moment for it. Returns `self.state`."""
+        app = self._app
+        if self._look() is None:
             return self.state
-        # The Pi's root is on NFS: read off the event loop, which also serves the serial bridge.
+        # The Pi's root is on NFS: read off the event loop, which also serves the serial bridge. Somebody may
+        # come meanwhile, so the look is taken again afterwards, and from there to taking the board nothing
+        # is awaited.
         data = await asyncio.to_thread(self._read)
         if data is None:
             return self.state
+        look = self._look()
+        if look is None:
+            return self.state
+        stamp, stage = look
+        taken = app["taken"]
+        taken.take()
         try:
             state = designs._parse_json(await app["repl"].exec(STATE_CODE))
+            enabled = state["enabled"] = named(state.get("enabled"))
             self._asked = (stamp, stage)
-            if not wanted(state, quiet, self.after, self.replace_after):
-                if state["enabled"] == designs.IDLE_NAME:
+            if not wanted(state, time.monotonic() - stamp, self.after, self.replace_after):
+                if enabled == designs.IDLE_NAME:
                     self.state = "loaded"
                 else:
-                    self.state = f"left: {state['enabled'] if state['sdk'] else 'the SDK is not running'}"
+                    self.state = f"left: {enabled if state['sdk'] else 'the SDK is not running'}"
                 return self.state
             if app["websockets"] or app["activity"].last != stamp:  # somebody came while the board was asked
                 self._asked = None
@@ -162,14 +234,19 @@ class IdleDisplay:
                 return self.state
             await designs.load_design(app["repl"], designs.IDLE_NAME, data, None)
         except (ReplBusy, ReplNoBoard):
-            self.state = "in use"
+            self._asked = None
+            self.state = "in use" if app["bridge"].present else "board not present"
         except ReplError as exc:
-            self._asked = (stamp, stage)  # not again until somebody has used the board, or the next stage
+            # Tried again after a new, longer, quiet time: a board that was still starting gets its display.
+            self._asked = None
+            app["activity"].last = max(app["activity"].last, time.monotonic() + FAILED_WAIT - self.after)
             self.state = f"failed: {exc}"
-            log.warning("idle display: %s: %s", exc, exc.detail[-200:])
+            log.warning("idle display: %s: %s", exc, _printable(exc.detail[-200:]))
         else:
             self.state = "loaded"
-            log.info("idle display: streamed %s into the unused board (was: %s)", self.design, state["enabled"])
+            log.info("idle display: streamed %s into the unused board (was: %s)", self.design, enabled)
+        finally:
+            taken.release()
         return self.state
 
     async def _run(self) -> None:
@@ -193,3 +270,9 @@ class IdleDisplay:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        self._app["taken"].release()
+
+
+def _printable(text: str) -> str:
+    """Board output for one line of the log."""
+    return "".join(c if " " <= c <= "~" else " " for c in text)

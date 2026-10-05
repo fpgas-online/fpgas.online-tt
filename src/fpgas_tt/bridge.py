@@ -127,6 +127,7 @@ class Bridge:
         self._write_lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
         self.present = False
+        self.opens = 0  # how many times the port was opened: a board that comes back is another count
 
     # -- lifecycle --
     async def start(self) -> None:
@@ -196,6 +197,7 @@ class Bridge:
 
         self._writer = writer
         self.present = True
+        self.opens += 1
         log.info("bridge: opened %s at %d baud", self.device, self.baudrate)
         try:
             await self._pump(reader, writer)

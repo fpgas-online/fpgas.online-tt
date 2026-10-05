@@ -100,6 +100,7 @@ def create_app(
     app["repl"] = ReplRunner(bridge)
     app["activity"] = idle.Activity()  # when somebody last used the board through this daemon
     app["idle"] = None  # the idle display (idle.py), when the daemon runs one
+    app["taken"] = idle.Taken()  # set while the idle display has the board: clients and Runs wait for it
     app.add_routes(
         [
             web.get("/health", health),
@@ -172,6 +173,7 @@ async def designs_list(request: web.Request) -> web.Response:
         app = request.app
         return web.json_response(await designs.list_designs(app["repl"], app["demos_dir"], app["uploads_dir"]))
 
+    await request.app["taken"].free()
     return await _run(request, go())
 
 
@@ -206,6 +208,7 @@ async def designs_enable(request: web.Request) -> web.Response:
         )
 
     request.app["activity"].touch()
+    await request.app["taken"].free()  # the idle display gives the board up when it sees somebody has come
     try:
         return await _run(request, go())
     finally:
@@ -217,6 +220,7 @@ async def bitstream_upload(request: web.Request) -> web.Response:
         return err
     if not request.content_type.startswith("multipart/"):
         return _json_error(400, "multipart form with fields 'name' and 'file' required")
+    request.app["activity"].touch()  # somebody is here, about to load it
     # aiohttp 3.8.4's request.multipart() does not honour Application's
     # client_max_size (fixed in later aiohttp) -- a declared oversized body
     # is rejected here before the parser ever runs; a body with no (or a
@@ -260,7 +264,7 @@ async def bitstream_upload(request: web.Request) -> web.Response:
     except ValidationError as exc:
         return _json_error(exc.status, str(exc))
 
-    request.app["activity"].touch()  # somebody is here, about to load it
+    request.app["activity"].touch()
     # Kept on the Pi: the board is not involved until somebody loads it.
     try:
         evicted = await asyncio.to_thread(designs.store_upload, request.app["uploads_dir"], name, data)
@@ -325,10 +329,14 @@ async def serial_ws(request: web.Request) -> web.WebSocketResponse:
             await ws.close(code=goodbye[0], message=goodbye[1])
 
     try:
+        # The socket is in `websockets` from the start, so the idle display sees that somebody has come and
+        # gives the board up; until it has, this client is held: accepted, and not yet bridged to the REPL,
+        # so a visitor never shares the REPL with the daemon's own load and never sees its bytes.
+        request.app["activity"].touch()
+        await request.app["taken"].free()
         # Subscribe inside the try: anything that fails from here on must
         # still unsubscribe, or the Client outlives its socket forever.
         client = bridge.subscribe()
-        request.app["activity"].touch()
         log.info("serial: client %s connected (%d total)", peer, bridge.clients)
         await ws.send_json({"event": "board", "present": bridge.present, "device": bridge.device})
         pump = asyncio.create_task(pump_board_to_ws(), name="fpgas-tt-pump")
@@ -415,9 +423,12 @@ def main(argv: list[str] | None = None) -> int:
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     if args.idle_design:
-        app["idle"] = idle.IdleDisplay(
-            app, design=args.idle_design, after=args.idle_after, replace_after=args.idle_replace_after
-        )
+        try:
+            app["idle"] = idle.IdleDisplay(
+                app, design=args.idle_design, after=args.idle_after, replace_after=args.idle_replace_after
+            )
+        except ValueError as exc:
+            build_parser().error(str(exc))
         app.on_startup.append(app["idle"].start)
         app.on_cleanup.insert(0, app["idle"].stop)  # before the bridge it talks through
     web.run_app(
