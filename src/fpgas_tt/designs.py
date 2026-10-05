@@ -29,7 +29,7 @@ import threading
 import time
 from pathlib import Path
 
-from fpgas_tt.repl import ReplError, ReplRunner
+from fpgas_tt.repl import ReplBusy, ReplError, ReplRunner
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +47,13 @@ META_FIELDS = ("title", "author", "description", "docs_url", "repo_url")
 # timeouts (30s/45s), so the whole load (sending the bitstream, the SPI transfer, the clock) has to fail
 # cleanly before the shorter of those would reset the connection.
 ENABLE_OVERALL_TIMEOUT = 25.0
+# A Run that had to wait for the board (the idle display had it) with less than this left of its deadline is
+# told the board is busy at once, instead of starting a load it cannot finish.
+ENABLE_LEAST = 8.0
+# The name the SDK is given for the design the daemon itself streams into a board nobody is using (idle.py).
+# It is not a design of the Pi's gallery, so no upload may take it: a page marks as running the listed design
+# whose name the SDK gives.
+IDLE_NAME = "idle_display"
 
 class ValidationError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
@@ -105,6 +112,8 @@ def validate_bitstream(name: str, data: bytes, demo_names: set[str]) -> None:
         raise ValidationError("name must match ^[a-z0-9_]{1,40}$")
     if name in demo_names:
         raise ValidationError(f"{name} is a demo name; pick another", 409)
+    if name == IDLE_NAME:
+        raise ValidationError(f"{name} is the daemon's own name for its idle display; pick another", 409)
     if len(data) > MAX_BITSTREAM_BYTES:
         raise ValidationError(f"bitstream too large ({len(data)} bytes, limit {MAX_BITSTREAM_BYTES})")
     if ICE40_PREAMBLE not in data[:PREAMBLE_WINDOW + len(ICE40_PREAMBLE)]:
@@ -313,17 +322,33 @@ async def list_designs(runner: ReplRunner, demos_dir: Path, uploads_dir: Path) -
 
 
 async def enable_design(
-    runner: ReplRunner, name: str, clock_hz: int | None, demos_dir: Path, uploads_dir: Path
+    runner: ReplRunner, name: str, clock_hz: int | None, demos_dir: Path, uploads_dir: Path, *, waited: float = 0.0
 ) -> dict:
+    """Load design `name`. `waited` is what the caller already spent waiting for the board: it comes out of
+    the deadline, which is the caller's whole request's, the start of the SDK included."""
     # design_file refuses a name the Pi could never have before anything goes near the board.
     data = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name)
-    started = time.monotonic()
-    await ensure_sdk(runner)
+    started = time.monotonic() - waited
+    if ENABLE_OVERALL_TIMEOUT - waited < ENABLE_LEAST:
+        raise ReplBusy("the board was busy for too long; try again")
+    try:
+        async with asyncio.timeout(ENABLE_OVERALL_TIMEOUT - waited):
+            await ensure_sdk(runner)
+            # What starting the SDK took comes out of the load's deadline.
+            left = ENABLE_OVERALL_TIMEOUT - (time.monotonic() - started)
+            await load_design(runner, name, data, clock_hz, overall=left)
+    except TimeoutError as exc:
+        raise ReplError("the load did not finish in time") from exc
+    return {"enabled": name, "clock_hz": clock_hz}
+
+
+async def load_design(
+    runner: ReplRunner, name: str, data: bytes, clock_hz: int | None, *, overall: float = ENABLE_OVERALL_TIMEOUT
+) -> None:
+    """Stream `data` into the FPGA through the SDK that is running on the board, under the name `name`. The
+    SDK is not started here: a board without it fails the load."""
     # timeout (per-read) stays 30s -- the SPI load takes a few seconds and any single read waiting on it is
-    # normal; overall is intentionally tighter (see ENABLE_OVERALL_TIMEOUT), and what starting the SDK took
-    # comes out of it.
-    overall = max(5.0, ENABLE_OVERALL_TIMEOUT - (time.monotonic() - started))
-    outs = await runner.exec_steps(_load_steps(name, data, clock_hz), timeout=30.0, overall=overall)
+    # normal; overall is intentionally tighter (see ENABLE_OVERALL_TIMEOUT).
+    outs = await runner.exec_steps(_load_steps(name, data, clock_hz), timeout=30.0, overall=max(5.0, overall))
     if outs[-1].strip().splitlines()[-1:] != ["enabled"]:
         raise ReplError("the board did not confirm the load", outs[-1])
-    return {"enabled": name, "clock_hz": clock_hz}
