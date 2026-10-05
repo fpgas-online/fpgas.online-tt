@@ -5,8 +5,10 @@ interesting. Currently the Tiny Tapeout FPGA boards end up with a static". The b
 design that animates the display from the FPGA's own oscillator. That lasts until the board's SDK next starts
 (a Commander that connects to a board without ``tt``, or a Run from the page, soft-resets the board): at every
 start SDK 3.1.0 loads its default project ``tt_um_factory_test`` and, on an FPGA board, forces the mode in
-which that project's ``ui_in = 1`` is not applied, so the factory test does not count and the display is a
-still pattern from the DIP switches.
+which that project's ``ui_in = 1`` is not applied and the RP2350 does not drive ``ui_in``. The factory test
+counts only when ``ui_in`` bit 0 is high, so what the display then shows is decided by pins nobody sets (the
+DIP switches, the Pi's Pmod HAT lines): a raw binary count on the segments, or a still pattern. On board
+4df39a7a6856f86f on 2026-10-05 ``ui_in`` read 00001001 and it counted.
 
 So when nobody is using the board the daemon streams the boot check's own design again (the same file on the
 Pi, the same way the page's Run loads a design: through the board's memory, nothing written to the board). It
@@ -20,7 +22,7 @@ The rules:
 * Only on a board the boot check's report says carries the FPGA breakout. A board with a Tiny Tapeout chip is
   left alone (its SDK's default configuration applies ``ui_in = 1`` to the factory test itself).
 * A board without the SDK's ``tt`` object is left alone: that is the state the boot check leaves, with its
-  moving design already in the FPGA, and starting the SDK would replace it with the still one.
+  moving design already in the FPGA, and starting the SDK would replace it with the factory test.
 * After ``after`` quiet seconds a board in the SDK's start state (the factory test, or nothing) gets the idle
   design. A design a visitor loaded is replaced only after ``replace_after`` quiet seconds, and that is off
   unless asked for: the daemon cannot see a visitor who is watching the camera or working on the Pi, and

@@ -87,8 +87,11 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   display from the FPGA's own oscillator, but every start of the board's SDK
   (a Commander that connects to a board without `tt`, or a Run from the page)
   replaces it: SDK 3.1.0 loads `tt_um_factory_test` and, on an FPGA board,
-  does not apply the `ui_in = 1` that makes it count, so the display is a
-  still pattern. When no serial client is connected and no client, Run or
+  does not apply the `ui_in = 1` that makes it count and does not drive
+  `ui_in`, so the display shows a raw binary count or a still pattern,
+  depending on pins nobody sets (the DIP switches, the Pi's Pmod HAT
+  lines). The daemon does not look at the display: when no serial client is
+  connected and no client, Run or
   upload has happened for `--idle-after` seconds (default 60), the daemon
   asks the board once what it has loaded (once more when
   `--idle-replace-after` is reached), and if that is the SDK's start
