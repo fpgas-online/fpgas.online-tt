@@ -108,7 +108,8 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
     most in all. So a visitor never shares the REPL with the daemon's own
     load and never sees its bytes. A Run or a design list that arrives then
     waits the same way, and what a Run waited comes out of its 25 s
-    deadline.
+    deadline, the start of the SDK included; a Run left with less than 8 s
+    of it answers `409 another task is running` at once.
   - A board that was unplugged, reset or power-cycled starts a new quiet
     time; so does a load that failed (ten minutes).
   - A board without the SDK's `tt` object is left alone: that is how the boot

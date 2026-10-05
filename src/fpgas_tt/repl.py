@@ -25,6 +25,7 @@ CTRL_B = b"\r\x02"
 CTRL_D = b"\x04"
 DETAIL_LIMIT = 2000
 LEAVE_DRAIN_TIMEOUT = 1.0  # bound on waiting for the friendly prompt on the way out
+LEAVE_TIMEOUT = LEAVE_DRAIN_TIMEOUT + 1.0  # bound on the whole way out, the write of Ctrl-B included
 # A real board echoes readline/pyexec preamble (a re-issued friendly prompt,
 # an echoed \r, ...) before the raw-REPL banner when CTRL_A is sent from the
 # friendly prompt -- enter() scans past it rather than assuming the banner is
@@ -101,25 +102,13 @@ class ReplRunner:
                 raise ReplNoBoard("board not present") from exc
             finally:
                 try:
-                    await client.write(CTRL_B)
-                    if session.raw:
-                        # We know the board is actually in raw REPL (enter()
-                        # confirmed the banner), so it will genuinely reply
-                        # to this Ctrl-B. Wait (briefly) for that friendly
-                        # prompt before releasing this client: the very next
-                        # task may subscribe its own client immediately
-                        # afterwards (e.g. a caller that issues several
-                        # sessions back to back), and if these leftover
-                        # "leaving raw REPL" bytes are still in flight when
-                        # it does, they land in the new session's read
-                        # stream and are misread as interference.
-                        # Best-effort only -- a failure here must never fail
-                        # the task, which has already succeeded or raised by
-                        # this point. When we never confirmed raw mode (no
-                        # board, silent board, interference before the
-                        # banner) there is nothing to wait for -- a reply
-                        # may never come -- so Ctrl-B stays fire-and-forget.
-                        await session.drain_to_friendly_prompt()
+                    # Bounded as a whole: a serial port that has stopped taking bytes must not hold the
+                    # runner's lock, and whoever waits for the board, for ever (the write itself waits
+                    # for the port to drain).
+                    async with asyncio.timeout(LEAVE_TIMEOUT):
+                        await self._leave(client, session)
+                except TimeoutError:
+                    log.warning("repl: the board did not take the end of the session in time")
                 except BoardNotPresent:
                     log.warning("repl: board went away before the session could be closed")
                 finally:
@@ -129,6 +118,27 @@ class ReplRunner:
                     # leak: unsubscribe it from the bridge no matter what.
                     client.close()
 
+    @staticmethod
+    async def _leave(client: Client, session: _Session) -> None:
+        await client.write(CTRL_B)
+        if session.raw:
+            # We know the board is actually in raw REPL (enter()
+            # confirmed the banner), so it will genuinely reply
+            # to this Ctrl-B. Wait (briefly) for that friendly
+            # prompt before releasing this client: the very next
+            # task may subscribe its own client immediately
+            # afterwards (e.g. a caller that issues several
+            # sessions back to back), and if these leftover
+            # "leaving raw REPL" bytes are still in flight when
+            # it does, they land in the new session's read
+            # stream and are misread as interference.
+            # Best-effort only -- a failure here must never fail
+            # the task, which has already succeeded or raised by
+            # this point. When we never confirmed raw mode (no
+            # board, silent board, interference before the
+            # banner) there is nothing to wait for -- a reply
+            # may never come -- so Ctrl-B stays fire-and-forget.
+            await session.drain_to_friendly_prompt()
 
     async def soft_reset(self, *, timeout: float = 10.0) -> str:
         """Soft-reset the board from the friendly REPL, exactly as the Commander does when the SDK does not

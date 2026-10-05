@@ -29,7 +29,7 @@ import threading
 import time
 from pathlib import Path
 
-from fpgas_tt.repl import ReplError, ReplRunner
+from fpgas_tt.repl import ReplBusy, ReplError, ReplRunner
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +47,9 @@ META_FIELDS = ("title", "author", "description", "docs_url", "repo_url")
 # timeouts (30s/45s), so the whole load (sending the bitstream, the SPI transfer, the clock) has to fail
 # cleanly before the shorter of those would reset the connection.
 ENABLE_OVERALL_TIMEOUT = 25.0
+# A Run that had to wait for the board (the idle display had it) with less than this left of its deadline is
+# told the board is busy at once, instead of starting a load it cannot finish.
+ENABLE_LEAST = 8.0
 # The name the SDK is given for the design the daemon itself streams into a board nobody is using (idle.py).
 # It is not a design of the Pi's gallery, so no upload may take it: a page marks as running the listed design
 # whose name the SDK gives.
@@ -322,13 +325,20 @@ async def enable_design(
     runner: ReplRunner, name: str, clock_hz: int | None, demos_dir: Path, uploads_dir: Path, *, waited: float = 0.0
 ) -> dict:
     """Load design `name`. `waited` is what the caller already spent waiting for the board: it comes out of
-    the deadline, which is the caller's whole request's."""
+    the deadline, which is the caller's whole request's, the start of the SDK included."""
     # design_file refuses a name the Pi could never have before anything goes near the board.
     data = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name)
     started = time.monotonic() - waited
-    await ensure_sdk(runner)
-    # What starting the SDK took comes out of the load's deadline.
-    await load_design(runner, name, data, clock_hz, overall=ENABLE_OVERALL_TIMEOUT - (time.monotonic() - started))
+    if ENABLE_OVERALL_TIMEOUT - waited < ENABLE_LEAST:
+        raise ReplBusy("the board was busy for too long; try again")
+    try:
+        async with asyncio.timeout(ENABLE_OVERALL_TIMEOUT - waited):
+            await ensure_sdk(runner)
+            # What starting the SDK took comes out of the load's deadline.
+            left = ENABLE_OVERALL_TIMEOUT - (time.monotonic() - started)
+            await load_design(runner, name, data, clock_hz, overall=left)
+    except TimeoutError as exc:
+        raise ReplError("the load did not finish in time") from exc
     return {"enabled": name, "clock_hz": clock_hz}
 
 

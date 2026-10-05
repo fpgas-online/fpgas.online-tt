@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from fpgas_tt import designs, idle
+from fpgas_tt import designs, idle, repl
 from fpgas_tt.bridge import Bridge
+from fpgas_tt.repl import ReplBusy, ReplError
 from fpgas_tt.server import build_parser, create_app
 from tests.test_designs import PRE, board_tree, wait_for
 from tests.test_server import DEMOS, IS_FPGA, IS_OTHER, NOT_NAMED
@@ -276,6 +277,48 @@ async def test_a_board_that_answers_something_else_is_a_failed_try_not_asked_aga
     for _ in range(3):
         assert await show.step() == "failed: the board did not say what it has loaded"
     assert len(calls) == 1 and not app["taken"].taken
+
+
+async def test_a_run_that_waited_too_long_is_told_the_board_is_busy_and_one_in_time_is_bounded_as_a_whole(
+    bridge, fake_repl, tmp_path, monkeypatch
+):
+    app = an_app(bridge, tmp_path)
+    with pytest.raises(ReplBusy):
+        await designs.enable_design(app["repl"], "tt_um_demo_a", None, DEMOS, tmp_path / "pi-uploads", waited=18)
+    assert fake_repl.transcript == b""
+
+    async def a_start_of_the_sdk_that_never_ends(runner):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(designs, "ensure_sdk", a_start_of_the_sdk_that_never_ends)
+    monkeypatch.setattr(designs, "ENABLE_OVERALL_TIMEOUT", 10.2)
+    monkeypatch.setattr(designs, "ENABLE_LEAST", 0.1)
+    with pytest.raises(ReplError, match="did not finish in time"):
+        await designs.enable_design(app["repl"], "tt_um_demo_a", None, DEMOS, tmp_path / "pi-uploads", waited=10)
+
+
+async def test_a_port_that_stops_taking_bytes_does_not_keep_the_board_taken(
+    bridge, fake_repl, tmp_path, design, monkeypatch
+):
+    """The way out of a REPL session writes Ctrl-B, and a write waits for the port: bounded too."""
+    sdk_started(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=design, after=60)
+    quiet_for(app, 60)
+    monkeypatch.setattr(idle, "TAKEN_LIMIT", 0.3)
+    monkeypatch.setattr(repl, "LEAVE_TIMEOUT", 0.2)
+    write = bridge.write
+    stuck = asyncio.Event()
+
+    async def a_port_that_takes_nothing_more(data):
+        if stuck.is_set() or len(data) > 200:  # from the first big write on
+            stuck.set()
+            await asyncio.sleep(3600)
+        await write(data)
+
+    monkeypatch.setattr(bridge, "write", a_port_that_takes_nothing_more)
+    state = await asyncio.wait_for(show.step(), 3)
+    assert state.startswith("failed: ") and not app["taken"].taken and not app["repl"].busy
 
 
 def test_taking_the_board_twice_leaves_nobody_waiting_behind():
