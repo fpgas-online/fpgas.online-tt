@@ -12,6 +12,7 @@ board plus a health endpoint. Design spec:
 - `src/fpgas_tt/usbinfo.py` — USB ids and serial number of the device behind a tty (sysfs)
 - `src/fpgas_tt/bridge.py` — `Bridge` (one serial owner) and `Client`
 - `src/fpgas_tt/server.py` — aiohttp app (`/health`, `/serial`) and CLI `main()`
+- `src/fpgas_tt/idle.py` — the idle display: a moving design streamed into an FPGA board nobody is using
 - `tests/` — pytest; a pty stands in for the board
 - `nfpm.yaml`, `debian/`, `bin/`, `packaging/deb-version.py` — deb packaging (arch all); rolling release, version from `git describe`, published on every green CI run on `main` (see README.md "Releases (rolling)")
 

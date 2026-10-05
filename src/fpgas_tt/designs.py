@@ -47,6 +47,10 @@ META_FIELDS = ("title", "author", "description", "docs_url", "repo_url")
 # timeouts (30s/45s), so the whole load (sending the bitstream, the SPI transfer, the clock) has to fail
 # cleanly before the shorter of those would reset the connection.
 ENABLE_OVERALL_TIMEOUT = 25.0
+# The name the SDK is given for the design the daemon itself streams into a board nobody is using (idle.py).
+# It is not a design of the Pi's gallery, so no upload may take it: a page marks as running the listed design
+# whose name the SDK gives.
+IDLE_NAME = "idle_display"
 
 class ValidationError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
@@ -105,6 +109,8 @@ def validate_bitstream(name: str, data: bytes, demo_names: set[str]) -> None:
         raise ValidationError("name must match ^[a-z0-9_]{1,40}$")
     if name in demo_names:
         raise ValidationError(f"{name} is a demo name; pick another", 409)
+    if name == IDLE_NAME:
+        raise ValidationError(f"{name} is the daemon's own name for its idle display; pick another", 409)
     if len(data) > MAX_BITSTREAM_BYTES:
         raise ValidationError(f"bitstream too large ({len(data)} bytes, limit {MAX_BITSTREAM_BYTES})")
     if ICE40_PREAMBLE not in data[:PREAMBLE_WINDOW + len(ICE40_PREAMBLE)]:
@@ -319,11 +325,18 @@ async def enable_design(
     data = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name)
     started = time.monotonic()
     await ensure_sdk(runner)
+    # What starting the SDK took comes out of the load's deadline.
+    await load_design(runner, name, data, clock_hz, overall=ENABLE_OVERALL_TIMEOUT - (time.monotonic() - started))
+    return {"enabled": name, "clock_hz": clock_hz}
+
+
+async def load_design(
+    runner: ReplRunner, name: str, data: bytes, clock_hz: int | None, *, overall: float = ENABLE_OVERALL_TIMEOUT
+) -> None:
+    """Stream `data` into the FPGA through the SDK that is running on the board, under the name `name`. The
+    SDK is not started here: a board without it fails the load."""
     # timeout (per-read) stays 30s -- the SPI load takes a few seconds and any single read waiting on it is
-    # normal; overall is intentionally tighter (see ENABLE_OVERALL_TIMEOUT), and what starting the SDK took
-    # comes out of it.
-    overall = max(5.0, ENABLE_OVERALL_TIMEOUT - (time.monotonic() - started))
-    outs = await runner.exec_steps(_load_steps(name, data, clock_hz), timeout=30.0, overall=overall)
+    # normal; overall is intentionally tighter (see ENABLE_OVERALL_TIMEOUT).
+    outs = await runner.exec_steps(_load_steps(name, data, clock_hz), timeout=30.0, overall=max(5.0, overall))
     if outs[-1].strip().splitlines()[-1:] != ["enabled"]:
         raise ReplError("the board did not confirm the load", outs[-1])
-    return {"enabled": name, "clock_hz": clock_hz}

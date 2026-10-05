@@ -1,7 +1,8 @@
 """HTTP/WebSocket front end for the bridge, and the ``fpgas-tt`` CLI.
 
 Endpoints:
-  GET  /health                  JSON status used by the site's status pill; says what the board is
+  GET  /health                  JSON status used by the site's status pill; says what the board is, and what
+                                 the idle display (idle.py) last did
   WS   /serial                  the bridge: binary frames <-> board bytes; text
                                  frames from the server are JSON events; text
                                  frames from the client are written to the board
@@ -39,7 +40,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from fpgas_tt import __version__, designs, identity
+from fpgas_tt import __version__, designs, identity, idle
 from fpgas_tt.bridge import BoardNotPresent, Bridge
 from fpgas_tt.designs import DEMOS_DIR_DEFAULT, UPLOADS_DIR_DEFAULT, DesignNotFound, ValidationError
 from fpgas_tt.identity import REPORT_DEFAULT, Identity
@@ -97,6 +98,8 @@ def create_app(
     app["demos_dir"] = Path(demos_dir)
     app["uploads_dir"] = Path(uploads_dir)
     app["repl"] = ReplRunner(bridge)
+    app["activity"] = idle.Activity()  # when somebody last used the board through this daemon
+    app["idle"] = None  # the idle display (idle.py), when the daemon runs one
     app.add_routes(
         [
             web.get("/health", health),
@@ -202,7 +205,11 @@ async def designs_enable(request: web.Request) -> web.Response:
             )
         )
 
-    return await _run(request, go())
+    request.app["activity"].touch()
+    try:
+        return await _run(request, go())
+    finally:
+        request.app["activity"].touch()  # the quiet time starts when the load has ended
 
 
 async def bitstream_upload(request: web.Request) -> web.Response:
@@ -253,6 +260,7 @@ async def bitstream_upload(request: web.Request) -> web.Response:
     except ValidationError as exc:
         return _json_error(exc.status, str(exc))
 
+    request.app["activity"].touch()  # somebody is here, about to load it
     # Kept on the Pi: the board is not involved until somebody loads it.
     try:
         evicted = await asyncio.to_thread(designs.store_upload, request.app["uploads_dir"], name, data)
@@ -277,6 +285,7 @@ async def health(request: web.Request) -> web.Response:
             "kind": who.kind,
             "kind_reason": who.reason,
             "clients": bridge.clients,
+            "idle_display": request.app["idle"].health() if request.app["idle"] is not None else None,
             "uptime_s": int(time.monotonic() - request.app["started"]),
             "version": request.app["version"],
         }
@@ -319,6 +328,7 @@ async def serial_ws(request: web.Request) -> web.WebSocketResponse:
         # Subscribe inside the try: anything that fails from here on must
         # still unsubscribe, or the Client outlives its socket forever.
         client = bridge.subscribe()
+        request.app["activity"].touch()
         log.info("serial: client %s connected (%d total)", peer, bridge.clients)
         await ws.send_json({"event": "board", "present": bridge.present, "device": bridge.device})
         pump = asyncio.create_task(pump_board_to_ws(), name="fpgas-tt-pump")
@@ -349,6 +359,7 @@ async def serial_ws(request: web.Request) -> web.WebSocketResponse:
         if client is not None:
             client.close()
         websockets.discard(ws)
+        request.app["activity"].touch()  # the quiet time starts when the last client has left
         log.info("serial: client %s disconnected (%d total)", peer, bridge.clients)
     return ws
 
@@ -363,6 +374,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-level", default="INFO", choices=list(LOG_LEVELS))
     p.add_argument("--demos-dir", default=str(DEMOS_DIR_DEFAULT), help="directory of demo bitstreams + index.json")
     p.add_argument("--uploads-dir", default=str(UPLOADS_DIR_DEFAULT), help="directory, on this Pi, that keeps uploads")
+    p.add_argument(
+        "--idle-design",
+        default=str(idle.IDLE_DESIGN_DEFAULT),
+        help="bitstream, on this Pi, streamed into an FPGA board nobody is using so its display moves; "
+        "empty for none",
+    )
+    p.add_argument(
+        "--idle-after",
+        type=float,
+        default=idle.IDLE_AFTER_DEFAULT,
+        help="seconds without a client, a Run or an upload before a board left in the SDK's start state gets it",
+    )
+    p.add_argument(
+        "--idle-replace-after",
+        type=float,
+        default=None,
+        help="seconds without a client, a Run or an upload before a design a visitor loaded is replaced by it "
+        "(default: never)",
+    )
     return p
 
 
@@ -384,6 +414,12 @@ def main(argv: list[str] | None = None) -> int:
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
+    if args.idle_design:
+        app["idle"] = idle.IdleDisplay(
+            app, design=args.idle_design, after=args.idle_after, replace_after=args.idle_replace_after
+        )
+        app.on_startup.append(app["idle"].start)
+        app.on_cleanup.insert(0, app["idle"].stop)  # before the bridge it talks through
     web.run_app(
         app,
         host=args.host,

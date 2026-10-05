@@ -17,12 +17,14 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
 - `GET /health` — `{"board": {"present": bool, "device": str,
   "vid_pid": str|null, "usb_serial": str|null, "chip": str|null},
   "kind": "fpga"|"other"|"unknown", "kind_reason": str, "clients": int,
+  "idle_display": {"design": str, "state": str}|null,
   "uptime_s": int, "version": str}`. `vid_pid` is the board's USB
   `idVendor:idProduct` and `usb_serial` its USB serial number (the value on
   the board's label), both read from sysfs (`null` if the device is not a USB
   tty). `chip` is what the board told the boot check it carries and `kind`
   follows from it; `kind_reason` says where that came from, or why it is not
-  known.
+  known. `idle_display` is the idle display's file and what it last did
+  (below).
 - On shutdown every open `/serial` socket is closed with code 1001
   (`server shutdown`); on board loss with 1011 (`board disconnected`).
 - **What the board is comes from the board, never from where it is plugged
@@ -80,6 +82,39 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   `/var/lib/fpgas-tt/uploads`, the service's `StateDirectory`) keeps uploads;
   on the fleet's Pis that is lost at a reboot, like everything else a visitor
   leaves on a Pi.
+- **The display of an FPGA board nobody is using is kept moving**
+  (`idle.py`). The boot check ends by streaming a design that animates the
+  display from the FPGA's own oscillator, but every start of the board's SDK
+  (a Commander that connects to a board without `tt`, or a Run from the page)
+  replaces it: SDK 3.1.0 loads `tt_um_factory_test` and, on an FPGA board,
+  does not apply the `ui_in = 1` that makes it count, so the display is a
+  still pattern. When no serial client is connected and no client, Run or
+  upload has happened for `--idle-after` seconds (default 60), the daemon
+  asks the board once what it has loaded, and if that is the SDK's start
+  state it streams the boot check's design again (`--idle-design`, default
+  `/usr/share/fpgas-online/tt-fpga/bitstreams/tt-display-tt-fpga/tt_fpga_platform.bin`
+  from `fpgas-online-tt-fpga-bitstreams`; empty for no idle display), the way
+  a Run loads a design, under the name `idle_display`. Nothing is written to
+  the board, and no pin or mode of the SDK is changed: the design ignores its
+  clock, reset and inputs.
+  - Nothing is typed at the board while a serial client is connected: while a
+    client is there the board is the visitor's, a still display included.
+  - A board without the SDK's `tt` object is left alone: that is how the boot
+    check leaves it, with the moving design already running.
+  - A design a visitor loaded is never replaced, unless
+    `--idle-replace-after SECONDS` is given. The daemon cannot see a visitor
+    who is watching the camera or working on the Pi, so that option is for
+    when the site's own end of a visitor's session can be tied to it.
+  - A board the report does not say carries the FPGA breakout is never
+    touched.
+  - `/health` says what happened, in `idle_display.state`: `waiting`,
+    `in use`, `loaded`, `left: <a visitor's design>`, `left: the SDK is not
+    running`, `not an fpga board`, `file missing`, `file is not an iCE40
+    bitstream`, or `failed: <why>`. A missing file is also logged once; the
+    file is looked for again at each quiet time, so a root that gains it
+    needs no restart.
+  - While the idle design is being streamed (a few seconds) a Run answers
+    `409 another task is running`.
 - Until 2026-10 the daemon copied every demo and every upload to the board's
   `/bitstreams` and loaded from there. Boards from that time still hold those
   files; the daemon neither reads nor removes them.
