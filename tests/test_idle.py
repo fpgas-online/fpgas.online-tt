@@ -202,6 +202,92 @@ async def test_a_run_that_arrives_while_the_idle_design_is_streamed_waits_and_th
     assert [name for name, _ in fake_repl.loaded] == ["pi:idle_display.bin", "pi:tt_um_demo_a.bin"]
 
 
+async def test_a_design_list_that_arrives_while_the_board_is_taken_waits(aiohttp_client, bridge, fake_repl, tmp_path):
+    app = an_app(bridge, tmp_path)
+    c = await aiohttp_client(app)
+    app["taken"].take()
+    asked = asyncio.ensure_future(c.get("/designs"))
+    await asyncio.sleep(0.1)
+    assert not asked.done() and fake_repl.transcript == b""
+    app["taken"].release()
+    assert (await asked).status == 200
+
+
+async def test_what_a_run_waited_for_the_board_comes_out_of_its_deadline(
+    aiohttp_client, bridge, fake_repl, tmp_path, monkeypatch
+):
+    app = an_app(bridge, tmp_path)
+    c = await aiohttp_client(app)
+    given: list = []
+
+    async def enable(*args, waited, **kwargs):
+        given.append(waited)
+        return {"enabled": "tt_um_demo_a", "clock_hz": None}
+
+    monkeypatch.setattr(designs, "enable_design", enable)
+    app["taken"].take()
+    run = asyncio.ensure_future(c.post("/designs/tt_um_demo_a/enable"))
+    await asyncio.sleep(0.2)
+    app["taken"].release()
+    assert (await run).status == 200 and 0.2 <= given[0] < 2
+
+    left: list = []
+
+    async def load(runner, name, data, clock_hz, *, overall):
+        left.append(overall)
+
+    monkeypatch.undo()
+    monkeypatch.setattr(designs, "load_design", load)
+    await designs.enable_design(app["repl"], "tt_um_demo_a", None, DEMOS, tmp_path / "pi-uploads", waited=10)
+    assert 14 < left[0] <= 15  # 25 s for the request, of which 10 went waiting
+
+
+async def test_the_board_is_not_kept_longer_than_the_limit_whatever_it_does(
+    bridge, fake_repl, tmp_path, design, monkeypatch
+):
+    sdk_started(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=design, after=60)
+    quiet_for(app, 60)
+    monkeypatch.setattr(idle, "TAKEN_LIMIT", 0.1)
+
+    async def never(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(app["repl"], "exec", never)
+    assert await show.step() == "failed: the board did not finish in time"
+    assert not app["taken"].taken
+
+
+async def test_a_board_that_answers_something_else_is_a_failed_try_not_asked_again_at_once(
+    bridge, fake_repl, tmp_path, design, monkeypatch
+):
+    sdk_started(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=design, after=60)
+    quiet_for(app, 60)
+    calls: list = []
+
+    async def odd(*args, **kwargs):
+        calls.append(1)
+        return "[1, 2]\n"
+
+    monkeypatch.setattr(app["repl"], "exec", odd)
+    for _ in range(3):
+        assert await show.step() == "failed: the board did not say what it has loaded"
+    assert len(calls) == 1 and not app["taken"].taken
+
+
+def test_taking_the_board_twice_leaves_nobody_waiting_behind():
+    taken = idle.Taken()
+    taken.take()
+    first = taken._free
+    taken.take()
+    assert taken._free is first
+    taken.release()
+    assert first.is_set() and not taken.taken
+
+
 async def test_a_board_that_comes_back_starts_a_new_quiet_time_and_gets_the_idle_design_again(
     bridge, fake_board, fake_repl, tmp_path, design
 ):

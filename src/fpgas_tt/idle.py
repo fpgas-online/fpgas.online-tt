@@ -30,7 +30,8 @@ The rules:
 * While the daemon is asking or streaming, the board is taken (``Taken``): a serial client that connects then
   is accepted and held, not bridged, until the daemon has finished or given up, and a Run waits the same way.
   So a visitor never shares the REPL with the daemon's own load and never sees its bytes. A client that
-  arrives while the board is being asked makes the daemon give up before it streams anything.
+  arrives while the board is being asked makes the daemon give up before it streams anything. The daemon
+  keeps the board for a bounded time (``TAKEN_LIMIT``), whatever the board or its serial port does.
 * A board that was unplugged, reset or power-cycled starts a new quiet time, as does a load that failed (a
   longer one), so a board that comes back in the SDK's start state gets the idle design again.
 """
@@ -63,6 +64,12 @@ SDK_START_DESIGN = "tt_um_factory_test"
 POLL = 5.0
 # After a load that failed, the board is left alone this long before the next try.
 FAILED_WAIT = 600.0
+# How long the daemon may keep the board to itself: the question, the load, and in all. Whoever arrives
+# meanwhile is held that long at most, and a Run that waited has the rest of its own deadline left
+# (designs.ENABLE_OVERALL_TIMEOUT), so the site's proxy still gets its answer in time.
+ASK_TIMEOUT = 5.0
+LOAD_TIMEOUT = 12.0
+TAKEN_LIMIT = 20.0
 
 STATE_CODE = (
     "import json\n"
@@ -94,7 +101,8 @@ class Taken:
         return self._free is not None
 
     def take(self) -> None:
-        self._free = asyncio.Event()
+        if self._free is None:  # taken twice is taken once: nobody waiting is left behind
+            self._free = asyncio.Event()
 
     def release(self) -> None:
         if self._free is not None:
@@ -219,7 +227,30 @@ class IdleDisplay:
         taken = app["taken"]
         taken.take()
         try:
-            state = designs._parse_json(await app["repl"].exec(STATE_CODE))
+            # In all, bounded: a serial port that stops taking bytes must not keep every visitor out.
+            async with asyncio.timeout(TAKEN_LIMIT):
+                return await self._ask_and_load(stamp, stage, data)
+        except TimeoutError:
+            self._failed(ReplError("the board did not finish in time"))
+        finally:
+            taken.release()
+        return self.state
+
+    def _failed(self, exc: ReplError) -> None:
+        """Tried again after a new, longer, quiet time: a board that was still starting gets its display."""
+        activity = self._app["activity"]
+        self._asked = None
+        activity.last = max(activity.last, time.monotonic() + FAILED_WAIT - self.after)
+        self.state = f"failed: {exc}"
+        log.warning("idle display: %s: %s", exc, _printable(exc.detail[-200:]))
+
+    async def _ask_and_load(self, stamp: float, stage: int, data: bytes) -> str:
+        app = self._app
+        try:
+            out = await app["repl"].exec(STATE_CODE, timeout=ASK_TIMEOUT, overall=ASK_TIMEOUT)
+            state = designs._parse_json(out)
+            if not isinstance(state, dict) or not isinstance(state.get("sdk"), bool):
+                raise ReplError("the board did not say what it has loaded", out)
             enabled = state["enabled"] = named(state.get("enabled"))
             self._asked = (stamp, stage)
             if not wanted(state, time.monotonic() - stamp, self.after, self.replace_after):
@@ -232,21 +263,15 @@ class IdleDisplay:
                 self._asked = None
                 self.state = "in use"
                 return self.state
-            await designs.load_design(app["repl"], designs.IDLE_NAME, data, None)
+            await designs.load_design(app["repl"], designs.IDLE_NAME, data, None, overall=LOAD_TIMEOUT)
         except (ReplBusy, ReplNoBoard):
             self._asked = None
             self.state = "in use" if app["bridge"].present else "board not present"
         except ReplError as exc:
-            # Tried again after a new, longer, quiet time: a board that was still starting gets its display.
-            self._asked = None
-            app["activity"].last = max(app["activity"].last, time.monotonic() + FAILED_WAIT - self.after)
-            self.state = f"failed: {exc}"
-            log.warning("idle display: %s: %s", exc, _printable(exc.detail[-200:]))
+            self._failed(exc)
         else:
             self.state = "loaded"
             log.info("idle display: streamed %s into the unused board (was: %s)", self.design, enabled)
-        finally:
-            taken.release()
         return self.state
 
     async def _run(self) -> None:

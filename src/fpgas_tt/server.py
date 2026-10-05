@@ -199,18 +199,19 @@ async def designs_enable(request: web.Request) -> web.Response:
             if not (CLOCK_HZ_MIN <= clock_hz <= CLOCK_HZ_MAX):
                 return _json_error(400, f"clock_hz must be between {CLOCK_HZ_MIN} and {CLOCK_HZ_MAX}")
 
-    async def go():
+    async def go(waited: float):
         app = request.app
         return web.json_response(
             await designs.enable_design(
-                app["repl"], request.match_info["name"], clock_hz, app["demos_dir"], app["uploads_dir"]
+                app["repl"], request.match_info["name"], clock_hz, app["demos_dir"], app["uploads_dir"], waited=waited
             )
         )
 
     request.app["activity"].touch()
+    arrived = time.monotonic()
     await request.app["taken"].free()  # the idle display gives the board up when it sees somebody has come
     try:
-        return await _run(request, go())
+        return await _run(request, go(time.monotonic() - arrived))
     finally:
         request.app["activity"].touch()  # the quiet time starts when the load has ended
 

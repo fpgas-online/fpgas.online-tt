@@ -102,10 +102,13 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
     client is there the board is the visitor's, a still display included.
   - A serial client that connects while the daemon is asking the board or
     streaming the idle design is accepted and held, not bridged, until the
-    daemon has finished or given up (it gives up at once if it was only
-    asking; a load takes a few seconds). So a visitor never shares the REPL
-    with the daemon's own load and never sees its bytes. A Run or a design
-    list that arrives then waits the same way.
+    daemon has finished or given up. If it was only asking, it finishes the
+    question (a moment; five seconds at most) and streams nothing; a load
+    takes a few seconds, and the daemon keeps the board twenty seconds at
+    most in all. So a visitor never shares the REPL with the daemon's own
+    load and never sees its bytes. A Run or a design list that arrives then
+    waits the same way, and what a Run waited comes out of its 25 s
+    deadline.
   - A board that was unplugged, reset or power-cycled starts a new quiet
     time; so does a load that failed (ten minutes).
   - A board without the SDK's `tt` object is left alone: that is how the boot

@@ -319,11 +319,13 @@ async def list_designs(runner: ReplRunner, demos_dir: Path, uploads_dir: Path) -
 
 
 async def enable_design(
-    runner: ReplRunner, name: str, clock_hz: int | None, demos_dir: Path, uploads_dir: Path
+    runner: ReplRunner, name: str, clock_hz: int | None, demos_dir: Path, uploads_dir: Path, *, waited: float = 0.0
 ) -> dict:
+    """Load design `name`. `waited` is what the caller already spent waiting for the board: it comes out of
+    the deadline, which is the caller's whole request's."""
     # design_file refuses a name the Pi could never have before anything goes near the board.
     data = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name)
-    started = time.monotonic()
+    started = time.monotonic() - waited
     await ensure_sdk(runner)
     # What starting the SDK took comes out of the load's deadline.
     await load_design(runner, name, data, clock_hz, overall=ENABLE_OVERALL_TIMEOUT - (time.monotonic() - started))
