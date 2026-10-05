@@ -61,10 +61,21 @@ def test_a_board_with_a_tiny_tapeout_chip_is_not_fpga_whatever_its_variant(tmp_p
     assert (who.kind, who.chip) == ("other", "asic")
 
 
-@pytest.mark.parametrize("chip", [None, "", 7])
+@pytest.mark.parametrize("chip", [None, "", "  ", 7])
 def test_a_variant_alone_does_not_make_a_board_fpga(tmp_path, serial, chip):
     who = identify("/dev/ttboard", _report(tmp_path, [_tt(chip=chip)]))
     assert who.kind == "unknown" and "without what it carries" in who.reason
+
+
+def test_a_chip_that_is_null_in_the_report_is_unknown(tmp_path, serial):
+    board = _tt(chip=None)
+    board["identity"]["chip"] = None  # written as JSON null
+    assert identify("/dev/ttboard", _report(tmp_path, [board])).kind == "unknown"
+
+
+@pytest.mark.parametrize("chip", ["fpga", "FPGA", " fpga\n"])
+def test_the_chip_is_read_whatever_its_case_or_the_space_around_it(tmp_path, serial, chip):
+    assert identify("/dev/ttboard", _report(tmp_path, [_tt(chip=chip)])).kind == "fpga"
 
 
 def test_the_reason_a_board_was_not_read_is_passed_on(tmp_path, serial):
@@ -127,6 +138,12 @@ def test_a_report_that_cannot_be_used_is_unknown_not_a_crash(tmp_path, serial, t
         who = identify("/dev/ttboard", path)
         assert who.kind == "unknown" and "cannot be used" in who.reason
     assert caplog.text.count("cannot be used") == 1  # said once, not at every request
+    # ... and said again when it happens after a report that could be read
+    path.write_text(json.dumps({"boards": []}))
+    assert identify("/dev/ttboard", path).reason.endswith("does not name board " + SERIAL)
+    path.write_bytes(text.encode("latin-1"))
+    identify("/dev/ttboard", path)
+    assert caplog.text.count("cannot be used") == 2
 
 
 def test_entries_that_are_not_boards_are_passed_over(tmp_path, serial):

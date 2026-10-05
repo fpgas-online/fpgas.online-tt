@@ -33,8 +33,8 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   `/run/fpgas-online/verify.json`, written by fpgas-verify from
   [fpgas.online-test-designs](https://github.com/fpgas-online/fpgas.online-test-designs)).
   The kind is what the board itself told the check it carries (the report's
-  `identity.chip`, read from the board's SDK by rpi-hwid): `fpga` is `kind:
-  fpga`, anything else (a Tiny Tapeout chip) is `other`. Until the report says
+  `identity.chip`, read from the board's SDK by rpi-hwid): the FPGA breakout
+  gives `kind: fpga`, anything else (a Tiny Tapeout chip) gives `other`. Until the report says
   it, the kind is `unknown`: no boot check yet this boot, a board plugged in
   since, or a check that found the board and could not read it (its own reason
   is passed on in `kind_reason`). The report's `variant` is not asked, because
@@ -43,8 +43,8 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   once that is fixed the variant can be believed here. How the check's tests
   went does not change the kind. Both are read at each request, so a boot
   check that finishes after the daemon has started needs no restart (at boot
-  `fpgas-verify.service` is ordered before this unit, so the report is there
-  first). The daemon never asks the
+  `fpgas-verify.service` orders itself `Before=fpgas-tt.service`, in its own
+  unit file in fpgas.online-test-designs, so the report is there first). The daemon never asks the
   board what it is: the boot check does that, and a second prober would get in
   a visitor's way. The serial bridge works whatever the kind.
 - On `kind: fpga` boards, three extra routes list, load and accept designs.

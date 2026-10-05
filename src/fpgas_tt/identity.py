@@ -82,7 +82,8 @@ def _part(board: dict, name: str) -> dict:
 
 
 def _text(value) -> str | None:
-    return value if isinstance(value, str) and value else None
+    """A field of the report as text, without the space around it; None when it is not text or is empty."""
+    return (value.strip() or None) if isinstance(value, str) else None
 
 
 def _serial_of(board: dict) -> str | None:
@@ -95,7 +96,7 @@ def _why_not_read(board: dict) -> str:
     identity = _part(board, "identity")
     for key in WHY_NOT_READ:
         if _text(identity.get(key)):
-            return identity[key]
+            return _text(identity[key])
     return _text(board.get("reason")) or "the boot check did not read what the board carries"
 
 
@@ -124,6 +125,8 @@ def identify(device: str, report_path: Path | str = REPORT_DEFAULT) -> Identity:
         return Identity(UNKNOWN, serial, None, f"the boot check has not written {report_path} yet")
     except (OSError, ValueError) as exc:
         return Identity(UNKNOWN, serial, None, _unusable(report_path, exc))
+    global _last_unusable
+    _last_unusable = None  # a report that reads again: the next one that does not is said again
     for board in boards:
         if _serial_of(board) != serial:
             continue
