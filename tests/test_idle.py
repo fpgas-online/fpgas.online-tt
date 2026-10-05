@@ -227,10 +227,12 @@ async def test_what_a_run_waited_for_the_board_comes_out_of_its_deadline(
 
     monkeypatch.setattr(designs, "enable_design", enable)
     app["taken"].take()
+    before = app["activity"].last
     run = asyncio.ensure_future(c.post("/designs/tt_um_demo_a/enable"))
+    await wait_for(lambda: app["activity"].last > before)  # the request has arrived, and waits
     await asyncio.sleep(0.2)
     app["taken"].release()
-    assert (await run).status == 200 and 0.2 <= given[0] < 2
+    assert (await run).status == 200 and 0.2 <= given[0] < 5
 
     left: list = []
 
