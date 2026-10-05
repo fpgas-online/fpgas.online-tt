@@ -18,11 +18,11 @@ from fpgas_tt.server import (
 )
 
 SERIAL = "a2961e5cac65b25f"
-# What identity.identify() gives for a board the boot check's report does not name, names as an FPGA demo
-# board, and names as some other Tiny Tapeout board.
+# What identity.identify() gives for a board the boot check's report does not name, one that told the check it
+# carries the FPGA breakout, and one that told it it carries a chip.
 NOT_NAMED = Identity(identity.UNKNOWN, SERIAL, None, "verify.json does not name board " + SERIAL)
-IS_FPGA = Identity(identity.FPGA, SERIAL, "tt-fpga", "verify.json says board " + SERIAL + " is tt-fpga")
-IS_OTHER = Identity(identity.OTHER, SERIAL, "tt-asic", "verify.json says board " + SERIAL + " is tt-asic")
+IS_FPGA = Identity(identity.FPGA, SERIAL, "fpga", "verify.json says board " + SERIAL + " carries fpga")
+IS_OTHER = Identity(identity.OTHER, SERIAL, "asic", "verify.json says board " + SERIAL + " carries asic")
 
 
 def fpga_app(bridge, **kwargs):
@@ -61,7 +61,7 @@ async def test_health_reports_board_and_identity(client):
     assert body["kind"] == "unknown"
     assert body["kind_reason"] == NOT_NAMED.reason
     assert body["board"]["usb_serial"] == SERIAL
-    assert body["board"]["variant"] is None
+    assert body["board"]["chip"] is None
     # nothing says where the board is plugged in
     assert not {"slug", "switch", "port", "hostname"} & set(body)
     assert body["board"]["vid_pid"] is None  # a pty has no USB identity
@@ -139,6 +139,10 @@ async def test_serial_ws_write_when_board_absent_reports_error(aiohttp_client, t
         await bridge.stop()
 
 
+FPGA_BOARD = {"board": "tt", "variant": "tt-fpga", "found": {"serial": SERIAL},
+              "identity": {"usb_serial": SERIAL, "chip": "fpga"}}
+
+
 def _report(tmp_path, boards):
     path = tmp_path / "verify.json"
     path.write_text(json.dumps({"schema_version": 2, "result": "pass", "boards": boards}))
@@ -155,7 +159,7 @@ def test_main_takes_the_kind_from_the_report(monkeypatch, tmp_path, caplog):
 
     monkeypatch.setattr("fpgas_tt.server.web.run_app", fake_run_app)
     monkeypatch.setattr(identity, "usb_serial_for_tty", lambda device: SERIAL)
-    report = _report(tmp_path, [{"board": "tt", "variant": "tt-fpga", "found": {"serial": SERIAL}}])
+    report = _report(tmp_path, [FPGA_BOARD])
     with caplog.at_level("INFO", logger="fpgas_tt.server"):
         rc = main(["--device", "/dev/null", "--report", str(report), "--port", "9999"])
     assert rc == 0
@@ -234,10 +238,10 @@ async def test_the_kind_follows_the_report_without_a_restart(aiohttp_client, bri
     c = await aiohttp_client(create_app(bridge, report=report, demos_dir=DEMOS, uploads_dir=tmp_path / "up"))
     assert (await c.get("/designs")).status == 503
     assert (await (await c.get("/health")).json())["kind"] == "unknown"
-    _report(tmp_path, [{"board": "tt", "variant": "tt-fpga", "found": {"serial": SERIAL}}])
+    _report(tmp_path, [FPGA_BOARD])
     assert (await c.get("/designs")).status == 200
     health = await (await c.get("/health")).json()
-    assert health["kind"] == "fpga" and health["board"]["variant"] == "tt-fpga"
+    assert health["kind"] == "fpga" and health["board"]["chip"] == "fpga"
 
 
 async def test_fpga_only_guard_is_checked_by_identity_not_truthiness(client, monkeypatch):
@@ -469,3 +473,20 @@ async def test_enable_rejects_invalid_clock_hz(fpga_client, clock_hz):
     resp = await fpga_client.post("/designs/some_name/enable", json={"clock_hz": clock_hz})
     assert resp.status == 400
     assert "clock_hz" in (await resp.json())["error"]
+
+
+async def test_nothing_stubbed_sysfs_and_a_real_report(aiohttp_client, bridge, fake_repl, tmp_path, monkeypatch):
+    """/health through the real identify(): a sysfs tree for the board's tty, and a report read from a Pi."""
+    from fpgas_tt import usbinfo
+    from tests.test_usbinfo import _fake_sysfs
+
+    tty = Path(bridge.device).resolve().name
+    root = _fake_sysfs(tmp_path, tty=tty, pid="0005", serial=SERIAL)
+    monkeypatch.setattr(usbinfo, "SYSFS_TTY_ROOT", str(root))
+    real = Path(__file__).parent / "data" / "verify-tt-fpga-2026-10-05.json"
+    c = await aiohttp_client(create_app(bridge, report=real, demos_dir=DEMOS, uploads_dir=tmp_path / "up"))
+    body = await (await c.get("/health")).json()
+    assert body["board"] == {"present": True, "device": bridge.device, "vid_pid": "2e8a:0005",
+                             "usb_serial": SERIAL, "chip": "fpga"}
+    assert body["kind"] == "fpga"
+    assert (await c.get("/designs")).status == 200

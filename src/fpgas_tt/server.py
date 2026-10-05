@@ -15,8 +15,8 @@ uploads in --uploads-dir), and loading one streams it into the FPGA through the 
 
 What the board is comes from the board, never from where it is plugged in (identity.py): its USB serial and
 the boot check's report on this Pi, read at each request. The three design/bitstream routes return 404
-``{"error": "not an fpga board", "detail": why}`` on a board the report says is not an FPGA demo board, 503
-``{"error": "board not identified yet", "detail": why}`` on one the report does not name yet, and map
+``{"error": "not an fpga board", "detail": why}`` on a board that told the check it carries a chip, 503
+``{"error": "board not identified yet", "detail": why}`` on one the report does not say that for yet, and map
 ``ReplRunner``/``designs`` exceptions onto the wire contract: 503 board not
 present, 409 another task is running (or a demo-name collision on upload),
 404 no such design (including a name POSTed to /designs/{name}/enable that
@@ -272,7 +272,7 @@ async def health(request: web.Request) -> web.Response:
                 "device": bridge.device,
                 "vid_pid": vid_pid_for_tty(bridge.device),
                 "usb_serial": who.usb_serial,
-                "variant": who.variant,
+                "chip": who.chip,
             },
             "kind": who.kind,
             "kind_reason": who.reason,
