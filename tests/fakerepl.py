@@ -174,13 +174,37 @@ class FakeMuxBitStream:
         self._loader.enable(self, force)
 
 
+class FakePort:
+    """One of the SDK's 8-bit ports (`tt.ui_in`, `tt.uio_oe_pico`): its `value`."""
+
+    def __init__(self, value: int = 0) -> None:
+        self.value = value
+
+
 class FakeTT:
     def __init__(self, fos: _FakeOs, loader=None) -> None:
         self.shuttle = FakeShuttle(fos, loader)
         self.clock_log: list[int] = []
+        # What a chip board's SDK has besides (DemoBoard in SDK 2.0.4): its mode, its ports, its project clock.
+        self.mode_str = "ASIC_RP_CONTROL"
+        self.ui_in = FakePort()
+        self.uio_oe_pico = FakePort()
+        self.clock_hz = 0
 
     def clock_project_PWM(self, hz: int):
         self.clock_log.append(hz)
+        self.clock_hz = hz
+
+    def clock_project_stop(self):
+        self.clock_hz = 0
+
+    @property
+    def is_auto_clocking(self) -> bool:
+        return self.clock_hz != 0
+
+    @property
+    def auto_clocking_freq(self) -> int:
+        return self.clock_hz
 
 
 @dataclass
