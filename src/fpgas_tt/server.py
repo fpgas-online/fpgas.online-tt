@@ -40,7 +40,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from fpgas_tt import __version__, designs, identity, idle
+from fpgas_tt import __version__, designs, identity, idle, safe
 from fpgas_tt.bridge import BoardNotPresent, Bridge
 from fpgas_tt.designs import DEMOS_DIR_DEFAULT, UPLOADS_DIR_DEFAULT, DesignNotFound, ValidationError
 from fpgas_tt.identity import REPORT_DEFAULT, Identity
@@ -100,6 +100,7 @@ def create_app(
     app["repl"] = ReplRunner(bridge)
     app["activity"] = idle.Activity()  # when somebody last used the board through this daemon
     app["idle"] = None  # the idle display (idle.py), when the daemon runs one
+    app["safe"] = None  # the safe state of a chip board (safe.py), when the daemon sets it
     app["taken"] = idle.Taken()  # set while the idle display has the board: clients and Runs wait for it
     app.add_routes(
         [
@@ -291,6 +292,7 @@ async def health(request: web.Request) -> web.Response:
             "kind_reason": who.reason,
             "clients": bridge.clients,
             "idle_display": request.app["idle"].health() if request.app["idle"] is not None else None,
+            "safe_start": request.app["safe"].health() if request.app["safe"] is not None else None,
             "uptime_s": int(time.monotonic() - request.app["started"]),
             "version": request.app["version"],
         }
@@ -432,6 +434,10 @@ def main(argv: list[str] | None = None) -> int:
             build_parser().error(str(exc))
         app.on_startup.append(app["idle"].start)
         app.on_cleanup.insert(0, app["idle"].stop)  # before the bridge it talks through
+    # A board with a Tiny Tapeout chip: the SDK's start state makes two drivers fight on the HAT (safe.py).
+    app["safe"] = safe.SafeStart(app)
+    app.on_startup.append(app["safe"].start)
+    app.on_cleanup.insert(0, app["safe"].stop)  # before the bridge it talks through
     web.run_app(
         app,
         host=args.host,

@@ -16,6 +16,7 @@ import contextlib
 import io
 import os
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -174,13 +175,133 @@ class FakeMuxBitStream:
         self._loader.enable(self, force)
 
 
+class FakePort:
+    """One of the SDK's 8-bit ports (`tt.uio_oe_pico`): its `value`."""
+
+    def __init__(self, value: int = 0) -> None:
+        self.value = value
+
+
+PIN_IN, PIN_OUT, PULL_DOWN = 0, 1, 2  # machine.Pin's constants, as far as the daemon uses them
+
+
+RP2040_UI_IN_GPIOS = [9, 10, 11, 12, 17, 18, 19, 20]  # TT06+ demo board (SDK 2.0.4's platform.py mask 0x1E1E00)
+
+
+class FakeUiPin:
+    """One of the SDK's ui_in pins (`tt.pins.ui_in<k>`, a StandardPin) and the GPIO behind it. Like the SDK's, it
+    keeps the mode and pull it last set (`mode`, `pull`, `is_input`): code that changes the GPIO itself, as the boot
+    check's wiring test does, changes `hw_mode` and `hw_pull` only, and the level follows those."""
+
+    def __init__(self, tt: FakeTT, bit: int) -> None:
+        self._tt, self._bit = tt, bit
+        self.gpio_num = RP2040_UI_IN_GPIOS[bit]
+        self._mode = self.hw_mode = PIN_OUT  # as the SDK leaves it at its start, in ASIC_RP_CONTROL
+        self._pull = self.hw_pull = PULL_DOWN
+
+    @property
+    def mode(self) -> int:
+        return self._mode
+
+    @mode.setter
+    def mode(self, mode: int) -> None:  # StandardPin: raw_pin.init(mode, pull=self._pull)
+        if mode == PIN_OUT and self.hw_mode != PIN_OUT:
+            self._tt.made_outputs.append(self._bit)
+            if self._tt.ui_out >> self._bit & 1:
+                self._tt.high_pulses.append(self._bit)  # driven high, if only until the register is written
+        self._mode = self.hw_mode = mode
+        self.hw_pull = self._pull
+
+    @property
+    def pull(self):
+        return self._pull
+
+    @pull.setter
+    def pull(self, pull) -> None:  # StandardPin: raw_pin.init(pull=pull)
+        self._pull = self.hw_pull = pull
+
+    @property
+    def is_input(self) -> bool:
+        return self._mode == PIN_IN
+
+    def __call__(self) -> int:
+        return self._tt.ui_level(self._bit)
+
+
+class FakeUiPort:
+    """`tt.ui_in`, as SDK 2.0.4 has it in ASIC_RP_CONTROL: a write sets the RP2040's output register only, a read
+    is the pins' levels (platform.py write_ui_in_byte / read_ui_in_byte)."""
+
+    def __init__(self, tt: FakeTT) -> None:
+        self._tt = tt
+
+    @property
+    def value(self) -> int:
+        return sum(self._tt.ui_level(k) << k for k in range(8))
+
+    @value.setter
+    def value(self, v: int) -> None:
+        self._tt.ui_out = v & 0xFF
+
+
 class FakeTT:
     def __init__(self, fos: _FakeOs, loader=None) -> None:
         self.shuttle = FakeShuttle(fos, loader)
         self.clock_log: list[int] = []
+        # What a chip board's SDK has besides (DemoBoard in SDK 2.0.4): its mode, its ports, its project clock.
+        self.mode_str = "ASIC_RP_CONTROL"
+        self.ui_out = 0  # the RP2040's output register for the ui_in pins
+        self.ui_in = FakeUiPort(self)
+        self.pins = types.SimpleNamespace(**{f"ui_in{k}": FakeUiPin(self, k) for k in range(8)})
+        self.uio_oe_pico = FakePort()
+        self.clock_hz = 0
+        # The board around the pins: ui_in bits a DIP switch that is on holds high (through its resistor, which an
+        # output beats); the bits whose input, with no pull, floats high (on board de641070db746f27, 8 Oct 2026:
+        # ui_in[0]); the chip's counter on uio, which the factory
+        # test drives while ui_in[0] is high and the HAT joins to ui_in[1:3].
+        self.dip_on: set[int] = set()
+        self.made_outputs: list[int] = []  # the ui_in pins made outputs, in order
+        self.high_pulses: list[int] = []  # ui_in pins made outputs while their register bit was 1
+        self.floats_high = {0}
+        self.counter = 0b0110
+
+    def ui_pin(self, k: int) -> FakeUiPin:
+        return getattr(self.pins, f"ui_in{k}")
+
+    def ui_level(self, k: int) -> int:
+        pin = self.ui_pin(k)
+        if pin.hw_mode == PIN_OUT:
+            return self.ui_out >> k & 1
+        if k in self.dip_on:
+            return 1
+        if k in (1, 2, 3) and self.ui_level(0) and self.counter >> k & 1:
+            return 1
+        return 0 if pin.hw_pull == PULL_DOWN else int(k in self.floats_high)
+
+    def released_by_the_boot_check(self) -> None:
+        """The ui_in pins as the boot check's wiring test leaves them (fpgas.online-test-designs issue #196):
+        plain inputs, no pull, set on the GPIOs behind the SDK's back: its pins still say output."""
+        for k in range(8):
+            self.ui_pin(k).hw_mode, self.ui_pin(k).hw_pull = PIN_IN, None
+
+    def gpio_oe(self) -> int:
+        """SIO GPIO_OE, as far as the ui_in GPIOs go."""
+        return sum(1 << self.ui_pin(k).gpio_num for k in range(8) if self.ui_pin(k).hw_mode == PIN_OUT)
 
     def clock_project_PWM(self, hz: int):
         self.clock_log.append(hz)
+        self.clock_hz = hz
+
+    def clock_project_stop(self):
+        self.clock_hz = 0
+
+    @property
+    def is_auto_clocking(self) -> bool:
+        return self.clock_hz != 0
+
+    @property
+    def auto_clocking_freq(self) -> int:
+        return self.clock_hz
 
 
 @dataclass
@@ -219,8 +340,22 @@ class FakeRepl:
         ttboard = types.ModuleType("ttboard")
         ttboard.fpga = fpga
         self.loader = loader
+        machine = types.ModuleType("machine")
+        machine.Pin = types.SimpleNamespace(IN=PIN_IN, OUT=PIN_OUT, PULL_DOWN=PULL_DOWN)
+        repl = self
+
+        class Mem32:  # machine.mem32, as far as the daemon reads it
+            def __getitem__(self, addr):
+                if addr == 0xD0000020:
+                    return repl.tt.gpio_oe()
+                raise AssertionError(f"the daemon read mem32[{addr:#x}], which the fake board does not have")
+
+        machine.mem32 = Mem32()
+        mp_time = types.ModuleType("time")  # MicroPython's: the host's, with sleep_ms
+        mp_time.__dict__.update({k: v for k, v in vars(time).items() if not k.startswith("__")})
+        mp_time.sleep_ms = lambda ms: None
         self._modules = {"ttboard": ttboard, "ttboard.fpga": fpga, "ttboard.fpga.fabricfoxv2": loader,
-                         "ttboard.fpga.fpga_mux": fpga_mux}  # fmt: skip
+                         "ttboard.fpga.fpga_mux": fpga_mux, "machine": machine, "time": mp_time}  # fmt: skip
         self.tt = FakeTT(self.fos, loader)
 
         self._globals: dict = {
