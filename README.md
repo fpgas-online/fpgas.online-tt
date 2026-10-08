@@ -18,12 +18,14 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   "vid_pid": str|null, "usb_serial": str|null, "chip": str|null},
   "kind": "fpga"|"other"|"unknown", "kind_reason": str, "clients": int,
   "idle_display": {"design": str, "state": str}|null,
+  "safe_start": {"state": str}|null,
   "uptime_s": int, "version": str}`. `vid_pid` is the board's USB
   `idVendor:idProduct` and `usb_serial` its USB serial number (the value on
   the board's label), both read from sysfs (`null` if the device is not a USB
   tty). `chip` is what the board told the boot check it carries and `kind`
   follows from it; `kind_reason` says where that came from, or why it is not
   known. `idle_display` is the idle display's file and what it last did
+  (below), and `safe_start` what the safe state of a chip board last did
   (below).
 - On shutdown every open `/serial` socket is closed with code 1001
   (`server shutdown`); on board loss with 1011 (`board disconnected`).
@@ -130,6 +132,27 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
     is not one a design here could have is said as `a design`. A missing
     file is also logged once; the file is looked for again at each quiet
     time, so a root that gains it needs no restart.
+- **A board with a Tiny Tapeout chip is put into a safe state, in its RAM**
+  (`safe.py`; fpgas.online-test-designs issue #181). At every start the
+  board's SDK loads the chip's `tt_um_factory_test` with its `config.ini`
+  section (`ui_in = 1`, clocked at 10 Hz, the RP2040 driving `ui_in`), and
+  with `ui_in[0]` high the factory test drives its counter onto `uio`. The
+  Pmod HAT makes one net of each of `ui_in[1:3]` and `uio[1:3]` (HAT JA2-4
+  and JB2-4 are the same Pi GPIOs), so the RP2040 and the chip drive against
+  each other there. Once each time the board is opened (the daemon's start,
+  which follows every boot check, and a board that comes back after it was
+  unplugged, reset or power-cycled), and only when nobody is using it, the
+  daemon stops the project clock, sets `ui_in` to 0 and releases the
+  RP2040's `uio` pins (`uio_oe_pico` 0). It does that only in the SDK's
+  start state (the factory test enabled, in `ASIC_RP_CONTROL`); any other
+  project or mode, an FPGA board and a board without the SDK are left alone,
+  and a visitor who came first has the board as they found it. Nothing is
+  written to a file on the board, and the daemon drives none of the Pi's
+  GPIOs; the state lasts until the board's SDK starts again (a Commander that
+  soft-resets the board). `/health` says what happened, in
+  `safe_start.state`: `waiting`, `waiting: <why the board's kind is not
+  known>`, `board not present`, `not a chip board`, `left: <why>`, `set:
+  <what was changed>`, or `failed: <why>` (tried again after 10 minutes).
 - Until 2026-10 the daemon copied every demo and every upload to the board's
   `/bitstreams` and loaded from there. Boards from that time still hold those
   files; the daemon neither reads nor removes them.
