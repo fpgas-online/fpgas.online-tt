@@ -190,8 +190,20 @@ class FakeUiPin:
 
     def __init__(self, tt: FakeTT, bit: int) -> None:
         self._tt, self._bit = tt, bit
-        self.mode = PIN_OUT  # as the SDK leaves it at its start, in ASIC_RP_CONTROL
+        self._mode = PIN_OUT  # as the SDK leaves it at its start, in ASIC_RP_CONTROL
         self.pull = PULL_DOWN
+
+    @property
+    def mode(self) -> int:
+        return self._mode
+
+    @mode.setter
+    def mode(self, mode: int) -> None:
+        if mode == PIN_OUT and self._mode != PIN_OUT:
+            self._tt.made_outputs.append(self._bit)
+            if self._tt.ui_out >> self._bit & 1:
+                self._tt.high_pulses.append(self._bit)  # driven high, if only until the register is written
+        self._mode = mode
 
     @property
     def is_input(self) -> bool:
@@ -233,6 +245,8 @@ class FakeTT:
         # ui_in[0]); the chip's counter on uio, which the factory
         # test drives while ui_in[0] is high and the HAT joins to ui_in[1:3].
         self.dip_on: set[int] = set()
+        self.made_outputs: list[int] = []  # the ui_in pins made outputs, in order
+        self.high_pulses: list[int] = []  # ui_in pins made outputs while their register bit was 1
         self.floats_high = {0}
         self.counter = 0b0110
 

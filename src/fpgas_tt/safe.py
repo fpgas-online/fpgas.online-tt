@@ -34,6 +34,8 @@ The rules:
   Any other project or mode, a factory test that is not being clocked (a visitor's, or a board already made safe),
   or a board without the SDK's ``tt`` object, is left as it is.
 * An exchange that failed is tried again after ``FAILED_WAIT`` seconds, or at once when the board is opened again.
+  That try acts on a factory test that is not being clocked too, because the failed try may have stopped the clock
+  itself. A visitor who connected in the meantime still has the board as they found it.
 """
 
 from __future__ import annotations
@@ -69,7 +71,8 @@ SAFE_CODE = (
     "    _fo_r['enabled'] = _fo_en.name if _fo_en else None\n"
     "    _fo_r['mode'] = _fo_tt.mode_str\n"
     "    _fo_r['clock_was'] = _fo_tt.auto_clocking_freq if _fo_tt.is_auto_clocking else 0\n"
-    f"    if _fo_r['enabled'] == {idle.SDK_START_DESIGN!r} and _fo_r['mode'] == {SDK_MODE!r} and _fo_r['clock_was']:\n"
+    f"    if _fo_r['enabled'] == {idle.SDK_START_DESIGN!r} and _fo_r['mode'] == {SDK_MODE!r}"
+    " and (_fo_r['clock_was'] or __RETRY__):\n"
     "        import time\n"
     "        from machine import Pin\n"
     "        _fo_r['ui_in_was'] = int(_fo_tt.ui_in.value)\n"
@@ -100,7 +103,13 @@ def _number(value) -> int | float | None:
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
-def outcome(reply) -> str:
+def safe_code(retry: bool) -> str:
+    """SAFE_CODE for this look. `retry`: the daemon's own earlier try, on this opening of the board, failed; it may
+    have stopped the clock itself, so a factory test that is not being clocked is no sign of a visitor then."""
+    return SAFE_CODE.replace("__RETRY__", "True" if retry else "False")
+
+
+def outcome(reply, retry: bool = False) -> str:
     """What the board's reply to SAFE_CODE says happened, for /health and the log. Raises ReplError when it is
     not such a reply, or when the board did not end in the safe state."""
     if not isinstance(reply, dict) or not isinstance(reply.get("sdk"), bool):
@@ -113,7 +122,7 @@ def outcome(reply) -> str:
     mode = reply.get("mode")
     if mode != SDK_MODE:
         return f"left: the board is in {mode if isinstance(mode, str) and MODE_RE.fullmatch(mode) else 'another'} mode"
-    if not _number(reply.get("clock_was")):
+    if not _number(reply.get("clock_was")) and not retry:
         return "left: the factory test is not being clocked (not the SDK's start state)"
     held, driven = reply.get("held"), reply.get("driven")
     if not (isinstance(held, list) and isinstance(driven, list) and all(isinstance(i, int) for i in held + driven)):
@@ -195,9 +204,11 @@ class SafeStart:
         taken.take()
         try:
             async with asyncio.timeout(TAKEN_LIMIT):
-                out = await app["repl"].exec(SAFE_CODE, timeout=ASK_TIMEOUT, overall=ASK_TIMEOUT)
-            self.state = outcome(designs._parse_json(out))
+                retry = self._retry is not None and self._retry[0] == opens
+                out = await app["repl"].exec(safe_code(retry), timeout=ASK_TIMEOUT, overall=ASK_TIMEOUT)
+            self.state = outcome(designs._parse_json(out), retry)
             self._done_for = opens
+            self._retry = None
             log.info("safe start: %s", self.state)
         except (ReplBusy, ReplNoBoard):
             self.state = "board not present" if not app["bridge"].present else "waiting"

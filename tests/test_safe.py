@@ -232,3 +232,37 @@ async def test_the_health_endpoint_says_what_the_safe_start_did(bridge, fake_rep
     client = await aiohttp_client(app)
     body = await (await client.get("/health")).json()
     assert body["safe_start"] == {"state": "waiting"}
+
+
+async def test_ui_in_is_never_driven_high_and_ui_in0_is_driven_first(bridge, fake_repl, tmp_path, settled):
+    """Review 2: the output register is 0 before any ui_in pin is made an output (no high pulse onto the HAT), and
+    ui_in[0] goes first (with it low the chip lets go of uio, and so of ui_in[1:3])."""
+    chip_sdk_started(fake_repl)
+    tt = fake_repl.tt
+    tt.released_by_the_boot_check()
+    assert (await safe.SafeStart(an_app(bridge, tmp_path, lambda: IS_OTHER)).step()).startswith("set: ")
+    assert tt.high_pulses == [] and tt.made_outputs == list(range(8))
+
+
+async def test_a_retry_after_a_failure_finishes_what_the_failed_try_began(bridge, fake_repl, tmp_path, settled):
+    """Review 2: the failed try stopped the clock itself, so the retry is not told it is "not the start state"."""
+    chip_sdk_started(fake_repl)
+    tt = fake_repl.tt
+    tt.released_by_the_boot_check()
+    tt.dip_on = {0}
+    start = safe.SafeStart(an_app(bridge, tmp_path, lambda: IS_OTHER))
+    assert (await start.step()).startswith("failed: the board did not take the safe state")
+    assert tt.clock_hz == 0  # the failed try stopped it
+    tt.dip_on = set()  # the switch is set off
+    start._retry = (start._retry[0], 0.0)  # FAILED_WAIT has passed
+    assert (await start.step()) == (
+        "set: clock stopped (was 0 Hz; its pin released), ui_in driven to 0 (read 0), uio released (uio_oe_pico was 0)"
+    )
+    assert tt.ui_in.value == 0 and driven(tt) == list(range(8)) and start._retry is None
+
+
+def test_only_a_retry_acts_on_a_factory_test_that_is_not_clocked():
+    assert "and (_fo_r['clock_was'] or False)" in safe.safe_code(False)
+    assert "and (_fo_r['clock_was'] or True)" in safe.safe_code(True)
+    left = {"sdk": True, "enabled": "tt_um_factory_test", "mode": "ASIC_RP_CONTROL", "clock_was": 0}
+    assert safe.outcome(left).startswith("left: the factory test is not being clocked")
