@@ -10,21 +10,30 @@ the chip driving its counter bits fight on those three nets, from power-on. Tim,
 (c)": (b) each chip board's ``config.ini`` is changed (his word for that write, done by hand, board by board) and
 (c) this: the daemon sets a safe state in RAM.
 
-The safe state: the project clock stopped, ``ui_in`` driven to 0 (so the factory test leaves ``uio`` as inputs
-and copies it to ``uo_out``), and the RP2040's own ``uio`` pins released (``uio_oe_pico`` 0, all inputs). Then
-no net of the HAT has two drivers: the daemon drives none of the Pi's GPIOs. Nothing is written to a file on the
-board (Tim, 2026-10-05); the state lasts until the board's SDK starts again.
+The safe state: the project clock stopped (its pin released), the RP2040's own ``uio`` pins released
+(``uio_oe_pico`` 0, all inputs), and ``ui_in`` driven to 0 by the RP2040, so the factory test leaves ``uio`` as
+inputs and copies it to ``uo_out``. Then no net of the HAT has two drivers: the daemon drives none of the Pi's
+GPIOs. ``ui_in``'s direction is set too, not only its value: the boot check's wiring test leaves the ui_in pins as
+inputs with no pull (fpgas.online-test-designs issue #196), and the SDK's ``ui_in.value`` only sets the output
+register. As the SDK does when it starts (its contention guard for the DIP switches), each ui_in pin gets the
+SDK's pull-down and is driven only if it then reads low, ``ui_in[0]`` first (with it low the chip lets go of
+``uio``, and so of ui_in[1:3] through the HAT). A pin still held high, by a DIP switch that is on, is left an
+input and said. Nothing is written to a file on the board (Tim, 2026-10-05); the state lasts until the board's SDK
+starts again.
 
 The rules:
 
 * Only on a board the boot check's report says carries a Tiny Tapeout chip (`identity.OTHER`). An FPGA board,
   and a board whose kind is not known yet, are left alone; the second is looked at again.
 * Once each time the board is opened: at the daemon's start (which follows every boot check, which stops and
-  starts the daemon) and when the board comes back after it was unplugged, reset or power-cycled.
-* Only when nobody else is using the board. A visitor who connects first has the board as they find it: the
-  daemon does not change it for that opening of the board.
-* Only the SDK's start state is changed: ``tt_um_factory_test`` enabled, in ASIC_RP_CONTROL mode. Any other
-  project or mode, or a board without the SDK's ``tt`` object, is left as it is.
+  starts the daemon) and when the board comes back after it was unplugged, reset or power-cycled; and only after
+  ``SETTLE`` quiet seconds from then, so a board whose SDK is still starting is not interrupted.
+* Only when nobody else is using the board. A visitor who connects in that time, or first, has the board as they
+  find it: the daemon does not change it for that opening of the board.
+* Only the SDK's start state is changed: ``tt_um_factory_test`` enabled, in ASIC_RP_CONTROL mode, and clocked.
+  Any other project or mode, a factory test that is not being clocked (a visitor's, or a board already made safe),
+  or a board without the SDK's ``tt`` object, is left as it is.
+* An exchange that failed is tried again after ``FAILED_WAIT`` seconds, or at once when the board is opened again.
 """
 
 from __future__ import annotations
@@ -43,6 +52,7 @@ from fpgas_tt.repl import ReplBusy, ReplError, ReplNoBoard
 log = logging.getLogger(__name__)
 
 POLL = 2.0
+SETTLE = 30.0  # quiet seconds after the board is opened before it is asked
 ASK_TIMEOUT = 5.0
 TAKEN_LIMIT = 10.0
 # After an exchange that failed, the board is left alone this long before the next try.
@@ -58,16 +68,30 @@ SAFE_CODE = (
     "    _fo_en = _fo_tt.shuttle.enabled\n"
     "    _fo_r['enabled'] = _fo_en.name if _fo_en else None\n"
     "    _fo_r['mode'] = _fo_tt.mode_str\n"
-    f"    if _fo_r['enabled'] == {idle.SDK_START_DESIGN!r} and _fo_r['mode'] == {SDK_MODE!r}:\n"
-    "        _fo_r['clock_was'] = _fo_tt.auto_clocking_freq if _fo_tt.is_auto_clocking else 0\n"
+    "    _fo_r['clock_was'] = _fo_tt.auto_clocking_freq if _fo_tt.is_auto_clocking else 0\n"
+    f"    if _fo_r['enabled'] == {idle.SDK_START_DESIGN!r} and _fo_r['mode'] == {SDK_MODE!r} and _fo_r['clock_was']:\n"
+    "        import time\n"
+    "        from machine import Pin\n"
     "        _fo_r['ui_in_was'] = int(_fo_tt.ui_in.value)\n"
     "        _fo_r['uio_oe_was'] = int(_fo_tt.uio_oe_pico.value)\n"
     "        _fo_tt.clock_project_stop()\n"
-    "        _fo_tt.ui_in.value = 0\n"
     "        _fo_tt.uio_oe_pico.value = 0\n"
+    "        _fo_tt.ui_in.value = 0\n"  # the output register: a pin made an output below starts low
+    "        _fo_r['held'] = []\n"
+    "        for _fo_i in range(8):\n"
+    "            _fo_p = getattr(_fo_tt.pins, 'ui_in%d' % _fo_i)\n"
+    "            if _fo_p.is_input:\n"
+    "                _fo_p.pull = Pin.PULL_DOWN\n"
+    "                time.sleep_ms(5)\n"
+    "                if _fo_p():\n"
+    "                    _fo_r['held'].append(_fo_i)\n"
+    "                    continue\n"
+    "                _fo_p.mode = Pin.OUT\n"
+    "        time.sleep_ms(5)\n"
     "        _fo_r['clock'] = _fo_tt.auto_clocking_freq if _fo_tt.is_auto_clocking else 0\n"
     "        _fo_r['ui_in'] = int(_fo_tt.ui_in.value)\n"
     "        _fo_r['uio_oe'] = int(_fo_tt.uio_oe_pico.value)\n"
+    "        _fo_r['driven'] = [_fo_i for _fo_i in range(8) if not getattr(_fo_tt.pins, 'ui_in%d' % _fo_i).is_input]\n"
     "print(json.dumps(_fo_r))\n"
 )
 
@@ -89,14 +113,31 @@ def outcome(reply) -> str:
     mode = reply.get("mode")
     if mode != SDK_MODE:
         return f"left: the board is in {mode if isinstance(mode, str) and MODE_RE.fullmatch(mode) else 'another'} mode"
-    after = {k: _number(reply.get(k)) for k in ("clock", "ui_in", "uio_oe")}
-    if after != {"clock": 0, "ui_in": 0, "uio_oe": 0}:
+    if not _number(reply.get("clock_was")):
+        return "left: the factory test is not being clocked (not the SDK's start state)"
+    held, driven = reply.get("held"), reply.get("driven")
+    if not (isinstance(held, list) and isinstance(driven, list) and all(isinstance(i, int) for i in held + driven)):
+        raise ReplError("the board did not say which ui_in pins it drives", repr(reply))
+    reads = _number(reply.get("ui_in"))
+    held_mask = sum(1 << i for i in held)
+    after = {k: _number(reply.get(k)) for k in ("clock", "uio_oe")}
+    if (
+        after != {"clock": 0, "uio_oe": 0}
+        or sorted(held + driven) != list(range(8))
+        or 0 in held  # with ui_in[0] high the chip still drives uio: that is not a safe state
+        or reads is None
+        or reads & ~held_mask & 0xFF
+    ):
         raise ReplError("the board did not take the safe state", repr(reply))
     was = {k: _number(reply.get(k + "_was")) for k in ("clock", "ui_in", "uio_oe")}
-    return (
-        f"set: clock stopped (was {was['clock']} Hz), ui_in 0 (was {was['ui_in']}), "
+    text = (
+        f"set: clock stopped (was {was['clock']} Hz; its pin released), ui_in driven to 0 (read {was['ui_in']}), "
         f"uio released (uio_oe_pico was {was['uio_oe']})"
     )
+    if held:
+        names = ", ".join(f"ui_in[{i}]" for i in held)
+        text += f"; {names} held high on the demo board (a DIP switch that is on?), left an input"
+    return text
 
 
 class SafeStart:
@@ -106,7 +147,8 @@ class SafeStart:
         # "not a chip board", "left: <why>", "set: <what changed>", "failed: <why>".
         self.state = "waiting"
         self._done_for: int | None = None  # the opening of the board (bridge.opens) this is settled for
-        self._retry_at = 0.0
+        self._seen: tuple[int, float] | None = None  # the opening last seen, and when it was first seen
+        self._retry: tuple[int, float] | None = None  # after a failure: the opening, and when to try again
         self._task: asyncio.Task | None = None
 
     def health(self) -> dict:
@@ -121,7 +163,10 @@ class SafeStart:
             self.state = "board not present"
             return None
         opens = bridge.opens
-        if self._done_for == opens or time.monotonic() < self._retry_at:
+        now = time.monotonic()
+        if self._seen is None or self._seen[0] != opens:
+            self._seen = (opens, now)
+        if self._done_for == opens or (self._retry is not None and self._retry[0] == opens and now < self._retry[1]):
             return None
         who = app["identify"]()
         if who.kind == identity.UNKNOWN:
@@ -134,6 +179,9 @@ class SafeStart:
         if app["websockets"] or app["repl"].busy or app["taken"].taken:
             self._done_for = opens  # the board is a visitor's as they found it
             self.state = "left: the board was in use first"
+            return None
+        if now - self._seen[1] < SETTLE:
+            self.state = "waiting"
             return None
         return opens
 
@@ -154,15 +202,15 @@ class SafeStart:
         except (ReplBusy, ReplNoBoard):
             self.state = "board not present" if not app["bridge"].present else "waiting"
         except TimeoutError:
-            self._failed(ReplError("the board did not answer in time"))
+            self._failed(opens, ReplError("the board did not answer in time"))
         except ReplError as exc:
-            self._failed(exc)
+            self._failed(opens, exc)
         finally:
             taken.release()
         return self.state
 
-    def _failed(self, exc: ReplError) -> None:
-        self._retry_at = time.monotonic() + FAILED_WAIT
+    def _failed(self, opens: int, exc: ReplError) -> None:
+        self._retry = (opens, time.monotonic() + FAILED_WAIT)
         self.state = f"failed: {exc}"
         log.warning("safe start: %s: %s", exc, idle._printable(exc.detail[-200:]))
 

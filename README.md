@@ -141,18 +141,26 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   and JB2-4 are the same Pi GPIOs), so the RP2040 and the chip drive against
   each other there. Once each time the board is opened (the daemon's start,
   which follows every boot check, and a board that comes back after it was
-  unplugged, reset or power-cycled), and only when nobody is using it, the
-  daemon stops the project clock, sets `ui_in` to 0 and releases the
-  RP2040's `uio` pins (`uio_oe_pico` 0). It does that only in the SDK's
-  start state (the factory test enabled, in `ASIC_RP_CONTROL`); any other
-  project or mode, an FPGA board and a board without the SDK are left alone,
-  and a visitor who came first has the board as they found it. Nothing is
-  written to a file on the board, and the daemon drives none of the Pi's
-  GPIOs; the state lasts until the board's SDK starts again (a Commander that
-  soft-resets the board). `/health` says what happened, in
+  unplugged, reset or power-cycled), after 30 quiet seconds, and only when
+  nobody is using it, the daemon stops the project clock (its pin
+  released), releases the RP2040's `uio` pins (`uio_oe_pico` 0) and drives
+  `ui_in` to 0. It sets `ui_in`'s direction too, not only its value: the
+  boot check's wiring test leaves the ui_in pins as inputs with no pull
+  (fpgas.online-test-designs issue #196). Like the SDK's own start, it gives
+  each ui_in pin the SDK's pull-down and drives it only if it then reads low,
+  `ui_in[0]` first; a pin still held high (a DIP switch that is on) is left
+  an input and said, and `ui_in[0]` held high is a failure. It does this only
+  in the SDK's start state (the factory test enabled, clocked, in
+  `ASIC_RP_CONTROL`); any other project or mode, a factory test that is not
+  being clocked, an FPGA board and a board without the SDK are left alone,
+  and a visitor who came first, or while it waited, has the board as they
+  found it. Nothing is written to a file on the board, and the daemon drives
+  none of the Pi's GPIOs; the state lasts until the board's SDK starts again
+  (a Commander that soft-resets the board). `/health` says what happened, in
   `safe_start.state`: `waiting`, `waiting: <why the board's kind is not
   known>`, `board not present`, `not a chip board`, `left: <why>`, `set:
-  <what was changed>`, or `failed: <why>` (tried again after 10 minutes).
+  <what was changed>`, or `failed: <why>` (tried again after 10 minutes, or
+  when the board is opened again).
 - Until 2026-10 the daemon copied every demo and every upload to the board's
   `/bitstreams` and loaded from there. Boards from that time still hold those
   files; the daemon neither reads nor removes them.
