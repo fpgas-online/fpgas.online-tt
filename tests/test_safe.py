@@ -47,7 +47,7 @@ def chip_sdk_started(fake_repl) -> None:
 
 
 def driven(tt) -> list[int]:
-    return [k for k in range(8) if tt.ui_pin(k).mode == PIN_OUT]
+    return [k for k in range(8) if tt.ui_pin(k).hw_mode == PIN_OUT]
 
 
 async def test_a_chip_board_in_the_sdks_start_state_is_made_safe_once_and_nothing_is_written(
@@ -70,7 +70,8 @@ async def test_a_chip_board_in_the_sdks_start_state_is_made_safe_once_and_nothin
 
 async def test_after_the_boot_check_the_ui_in_pins_are_driven_again(bridge, fake_repl, tmp_path, settled):
     """fpgas.online-test-designs issue #196: the wiring test leaves ui_in as inputs with no pull, ui_in[0] floating
-    high, so the factory test drives its counter onto uio, and so onto ui_in[1:3] through the HAT."""
+    high, so the factory test drives its counter onto uio, and so onto ui_in[1:3] through the HAT. It does that
+    behind the SDK's back: the SDK's pins still say they are outputs (live run 4, 8 Oct 2026, 21:15)."""
     chip_sdk_started(fake_repl)
     tt = fake_repl.tt
     tt.released_by_the_boot_check()
@@ -78,7 +79,7 @@ async def test_after_the_boot_check_the_ui_in_pins_are_driven_again(bridge, fake
     start = safe.SafeStart(an_app(bridge, tmp_path, lambda: IS_OTHER))
     assert await start.step() == SET.format(read=7, oe=0)
     assert (tt.ui_in.value, driven(tt)) == (0, list(range(8)))
-    assert all(tt.ui_pin(k).pull == PULL_DOWN for k in range(8))
+    assert all(tt.ui_pin(k).hw_pull == PULL_DOWN for k in range(8))
 
 
 async def test_a_dip_switch_that_is_on_is_not_driven_against_and_is_said(bridge, fake_repl, tmp_path, settled):
@@ -88,7 +89,7 @@ async def test_a_dip_switch_that_is_on_is_not_driven_against_and_is_said(bridge,
     tt.dip_on = {4}
     state = await safe.SafeStart(an_app(bridge, tmp_path, lambda: IS_OTHER)).step()
     assert state.endswith("; ui_in[4] held high on the demo board (a DIP switch that is on?), left an input")
-    assert tt.ui_pin(4).mode == PIN_IN and driven(tt) == [0, 1, 2, 3, 5, 6, 7]
+    assert tt.ui_pin(4).hw_mode == PIN_IN and driven(tt) == [0, 1, 2, 3, 5, 6, 7]
 
 
 async def test_ui_in0_held_high_is_not_a_safe_state(bridge, fake_repl, tmp_path, settled):

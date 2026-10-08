@@ -185,29 +185,44 @@ class FakePort:
 PIN_IN, PIN_OUT, PULL_DOWN = 0, 1, 2  # machine.Pin's constants, as far as the daemon uses them
 
 
+RP2040_UI_IN_GPIOS = [9, 10, 11, 12, 17, 18, 19, 20]  # TT06+ demo board (SDK 2.0.4's platform.py mask 0x1E1E00)
+
+
 class FakeUiPin:
-    """One of the SDK's ui_in pins (`tt.pins.ui_in<k>`, a StandardPin): its direction and pull, and its level."""
+    """One of the SDK's ui_in pins (`tt.pins.ui_in<k>`, a StandardPin) and the GPIO behind it. Like the SDK's, it
+    keeps the mode and pull it last set (`mode`, `pull`, `is_input`): code that changes the GPIO itself, as the boot
+    check's wiring test does, changes `hw_mode` and `hw_pull` only, and the level follows those."""
 
     def __init__(self, tt: FakeTT, bit: int) -> None:
         self._tt, self._bit = tt, bit
-        self._mode = PIN_OUT  # as the SDK leaves it at its start, in ASIC_RP_CONTROL
-        self.pull = PULL_DOWN
+        self.gpio_num = RP2040_UI_IN_GPIOS[bit]
+        self._mode = self.hw_mode = PIN_OUT  # as the SDK leaves it at its start, in ASIC_RP_CONTROL
+        self._pull = self.hw_pull = PULL_DOWN
 
     @property
     def mode(self) -> int:
         return self._mode
 
     @mode.setter
-    def mode(self, mode: int) -> None:
-        if mode == PIN_OUT and self._mode != PIN_OUT:
+    def mode(self, mode: int) -> None:  # StandardPin: raw_pin.init(mode, pull=self._pull)
+        if mode == PIN_OUT and self.hw_mode != PIN_OUT:
             self._tt.made_outputs.append(self._bit)
             if self._tt.ui_out >> self._bit & 1:
                 self._tt.high_pulses.append(self._bit)  # driven high, if only until the register is written
-        self._mode = mode
+        self._mode = self.hw_mode = mode
+        self.hw_pull = self._pull
+
+    @property
+    def pull(self):
+        return self._pull
+
+    @pull.setter
+    def pull(self, pull) -> None:  # StandardPin: raw_pin.init(pull=pull)
+        self._pull = self.hw_pull = pull
 
     @property
     def is_input(self) -> bool:
-        return self.mode == PIN_IN
+        return self._mode == PIN_IN
 
     def __call__(self) -> int:
         return self._tt.ui_level(self._bit)
@@ -255,19 +270,23 @@ class FakeTT:
 
     def ui_level(self, k: int) -> int:
         pin = self.ui_pin(k)
-        if not pin.is_input:
+        if pin.hw_mode == PIN_OUT:
             return self.ui_out >> k & 1
         if k in self.dip_on:
             return 1
         if k in (1, 2, 3) and self.ui_level(0) and self.counter >> k & 1:
             return 1
-        return 0 if pin.pull == PULL_DOWN else int(k in self.floats_high)
+        return 0 if pin.hw_pull == PULL_DOWN else int(k in self.floats_high)
 
     def released_by_the_boot_check(self) -> None:
         """The ui_in pins as the boot check's wiring test leaves them (fpgas.online-test-designs issue #196):
-        plain inputs, no pull."""
+        plain inputs, no pull, set on the GPIOs behind the SDK's back: its pins still say output."""
         for k in range(8):
-            self.ui_pin(k).mode, self.ui_pin(k).pull = PIN_IN, None
+            self.ui_pin(k).hw_mode, self.ui_pin(k).hw_pull = PIN_IN, None
+
+    def gpio_oe(self) -> int:
+        """SIO GPIO_OE, as far as the ui_in GPIOs go."""
+        return sum(1 << self.ui_pin(k).gpio_num for k in range(8) if self.ui_pin(k).hw_mode == PIN_OUT)
 
     def clock_project_PWM(self, hz: int):
         self.clock_log.append(hz)
@@ -323,6 +342,15 @@ class FakeRepl:
         self.loader = loader
         machine = types.ModuleType("machine")
         machine.Pin = types.SimpleNamespace(IN=PIN_IN, OUT=PIN_OUT, PULL_DOWN=PULL_DOWN)
+        repl = self
+
+        class Mem32:  # machine.mem32, as far as the daemon reads it
+            def __getitem__(self, addr):
+                if addr == 0xD0000020:
+                    return repl.tt.gpio_oe()
+                raise AssertionError(f"the daemon read mem32[{addr:#x}], which the fake board does not have")
+
+        machine.mem32 = Mem32()
         mp_time = types.ModuleType("time")  # MicroPython's: the host's, with sleep_ms
         mp_time.__dict__.update({k: v for k, v in vars(time).items() if not k.startswith("__")})
         mp_time.sleep_ms = lambda ms: None

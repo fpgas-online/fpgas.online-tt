@@ -14,11 +14,13 @@ The safe state: the project clock stopped (its pin released), the RP2040's own `
 (``uio_oe_pico`` 0, all inputs), and ``ui_in`` driven to 0 by the RP2040, so the factory test leaves ``uio`` as
 inputs and copies it to ``uo_out``. Then no net of the HAT has two drivers: the daemon drives none of the Pi's
 GPIOs. ``ui_in``'s direction is set too, not only its value: the boot check's wiring test leaves the ui_in pins as
-inputs with no pull (fpgas.online-test-designs issue #196), and the SDK's ``ui_in.value`` only sets the output
-register. As the SDK does when it starts (its contention guard for the DIP switches), each ui_in pin gets the
-SDK's pull-down and is driven only if it then reads low, ``ui_in[0]`` first (with it low the chip lets go of
+inputs with no pull (fpgas.online-test-designs issue #196), behind the SDK's back (its pins keep the mode it last
+set), and the SDK's ``ui_in.value`` only sets the output register. As the SDK does when it starts (its contention
+guard for the DIP switches), each ui_in pin is made an input with the SDK's pull-down, whatever the SDK believes it
+is, and is driven only if it then reads low, ``ui_in[0]`` first (with it low the chip lets go of
 ``uio``, and so of ui_in[1:3] through the HAT). A pin still held high, by a DIP switch that is on, is left an
-input and said. Nothing is written to a file on the board (Tim, 2026-10-05); the state lasts until the board's SDK
+input and said. Which pins are driven is read back from the RP2040's GPIO_OE register, not from the SDK. Nothing
+is written to a file on the board (Tim, 2026-10-05); the state lasts until the board's SDK
 starts again.
 
 The rules:
@@ -80,21 +82,26 @@ SAFE_CODE = (
     "        _fo_tt.clock_project_stop()\n"
     "        _fo_tt.uio_oe_pico.value = 0\n"
     "        _fo_tt.ui_in.value = 0\n"  # the output register: a pin made an output below starts low
+    "        import machine\n"
     "        _fo_r['held'] = []\n"
     "        for _fo_i in range(8):\n"
     "            _fo_p = getattr(_fo_tt.pins, 'ui_in%d' % _fo_i)\n"
-    "            if _fo_p.is_input:\n"
-    "                _fo_p.pull = Pin.PULL_DOWN\n"
-    "                time.sleep_ms(5)\n"
-    "                if _fo_p():\n"
-    "                    _fo_r['held'].append(_fo_i)\n"
-    "                    continue\n"
-    "                _fo_p.mode = Pin.OUT\n"
+    # Whatever the SDK believes: its pin keeps the mode it last set, and the boot check changed the pins behind
+    # it (issue #196). An input with the pull-down first; driven only if it then reads low.
+    "            _fo_p.mode = Pin.IN\n"
+    "            _fo_p.pull = Pin.PULL_DOWN\n"
+    "            time.sleep_ms(5)\n"
+    "            if _fo_p():\n"
+    "                _fo_r['held'].append(_fo_i)\n"
+    "                continue\n"
+    "            _fo_p.mode = Pin.OUT\n"
     "        time.sleep_ms(5)\n"
+    "        _fo_oe = machine.mem32[0xd0000020]\n"  # SIO GPIO_OE: which pins the RP2040 drives, from the hardware
     "        _fo_r['clock'] = _fo_tt.auto_clocking_freq if _fo_tt.is_auto_clocking else 0\n"
     "        _fo_r['ui_in'] = int(_fo_tt.ui_in.value)\n"
     "        _fo_r['uio_oe'] = int(_fo_tt.uio_oe_pico.value)\n"
-    "        _fo_r['driven'] = [_fo_i for _fo_i in range(8) if not getattr(_fo_tt.pins, 'ui_in%d' % _fo_i).is_input]\n"
+    "        _fo_r['driven'] = [_fo_i for _fo_i in range(8)\n"
+    "                           if _fo_oe >> getattr(_fo_tt.pins, 'ui_in%d' % _fo_i).gpio_num & 1]\n"
     "print(json.dumps(_fo_r))\n"
 )
 
