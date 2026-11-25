@@ -11,7 +11,9 @@ board plus a health endpoint. Design spec:
 - `src/fpgas_tt/identity.py` — what the board is, from its USB serial and the boot check's report; `identify()`
 - `src/fpgas_tt/usbinfo.py` — USB ids and serial number of the device behind a tty (sysfs)
 - `src/fpgas_tt/bridge.py` — `Bridge` (one serial owner) and `Client`
-- `src/fpgas_tt/server.py` — aiohttp app (`/health`, `/serial`) and CLI `main()`
+- `src/fpgas_tt/server.py` — aiohttp app (`/health`, `/serial`, and on FPGA boards `/designs`, `/designs/{name}/enable`, `/bitstream`, `/library`, `/library/{id}`) and CLI `main()`
+- `src/fpgas_tt/designs.py` — list and load the Pi's designs (a demo first, then a library entry, then an upload) and keep uploads
+- `src/fpgas_tt/library.py` — the VGA library's cache in `--library-dir`: `<id>.bin` + `<id>.json` (`id`, `bin_sha256`, `bin_bytes` only), LRU by the `.json`'s mtime under `--library-max-bytes` (env `FPGAS_TT_LIBRARY_MAX_BYTES`, else 16 MiB), orphans removed under `_LIBRARY_LOCK`; imports nothing from `designs`, never touches uploads
 - `src/fpgas_tt/idle.py` — the idle display: a moving design streamed into an FPGA board nobody is using
 - `src/fpgas_tt/safe.py` — the safe state of a chip board, set in its RAM at the daemon's start (issue #181)
 - `tests/` — pytest; a pty stands in for the board
@@ -22,6 +24,9 @@ viewers and future tasks) is a bridge client; no arbitration; slow clients are
 dropped, the reader never blocks; nothing is fetched or generated after boot;
 nothing says which switch port a board is on (a board is known by its USB
 serial, the value on its label); nothing writes to the demo board's files.
+The VGA library keeps "nothing is fetched after boot": the Pi fetches nothing,
+and library entries arrive only by push from the gateway (`POST /library/{id}`
+from the site, over the per-port VLAN that already carries `/bitstream`).
 
 ## Conventions
 
