@@ -1,12 +1,14 @@
 import asyncio
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 
 import aiohttp
 import pytest
 
-from fpgas_tt import __version__, designs, identity
+from fpgas_tt import __version__, designs, identity, library
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.designs import ICE40_PREAMBLE
 from fpgas_tt.identity import Identity
@@ -16,6 +18,7 @@ from fpgas_tt.server import (
     create_app,
     main,
 )
+from tests.test_library import ENTRIES
 
 SERIAL = "a2961e5cac65b25f"
 # What identity.identify() gives for a board the boot check's report does not name, one that told the check it
@@ -210,10 +213,15 @@ DEMOS = Path(__file__).parent / "data" / "demos"
 @pytest.fixture
 async def fpga_client(aiohttp_client, bridge, fake_repl, tmp_path):
     # the designs are the Pi's: the packaged demos, and uploads in a directory of this test's own
-    return await aiohttp_client(fpga_app(bridge, demos_dir=DEMOS, uploads_dir=tmp_path / "pi-uploads"))
+    return await aiohttp_client(
+        fpga_app(bridge, demos_dir=DEMOS, uploads_dir=tmp_path / "pi-uploads", library_dir=tmp_path / "pi-library")
+    )
 
 
-ROUTES = (("GET", "/designs"), ("POST", "/designs/x/enable"), ("POST", "/bitstream"))
+ROUTES = (
+    ("GET", "/designs"), ("POST", "/designs/x/enable"), ("POST", "/bitstream"), ("GET", "/library"),
+    ("POST", "/library/x"),
+)  # fmt: skip
 
 
 async def test_fpga_routes_503_until_the_board_is_identified(client):
@@ -384,7 +392,7 @@ async def test_board_returning_unparseable_output_gives_502_json_not_500_text(fp
 
 
 async def test_unexpected_exception_in_task_gives_500_json_not_default_text(fpga_client, monkeypatch):
-    async def boom(runner, demos_dir, uploads_dir):
+    async def boom(runner, demos_dir, uploads_dir, **kwargs):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(designs, "list_designs", boom)
@@ -399,7 +407,7 @@ async def test_unexpected_exception_in_task_gives_500_json_not_default_text(fpga
 async def test_replerror_detail_is_sanitized_before_it_reaches_http(fpga_client, monkeypatch):
     from fpgas_tt.repl import ReplError
 
-    async def boom(runner, demos_dir, uploads_dir):
+    async def boom(runner, demos_dir, uploads_dir, **kwargs):
         raise ReplError("x", "\x1b[31mRED\x1b[0m\x01\x02bad\nline")
 
     monkeypatch.setattr(designs, "list_designs", boom)
@@ -490,3 +498,249 @@ async def test_nothing_stubbed_sysfs_and_a_real_report(aiohttp_client, bridge, f
                              "usb_serial": SERIAL, "chip": "fpga"}
     assert body["kind"] == "fpga"
     assert (await c.get("/designs")).status == 200
+
+
+# -- the VGA library: the site pushes entries, the Pi keeps them, a load reads them --
+
+LIB_ID, LIB_SHA, LIB_DATA = ENTRIES[1]  # ttsky25a_vga_example, 4096 bytes
+LIB_META = {"id": LIB_ID, "bin_sha256": LIB_SHA, "bin_bytes": len(LIB_DATA)}
+BOTH_PARTS = "multipart form with parts 'meta' and 'file' required"
+
+
+def push_form(meta=LIB_META, file=LIB_DATA) -> aiohttp.FormData:
+    form = aiohttp.FormData()
+    if meta is not None:
+        form.add_field("meta", meta if isinstance(meta, str) else json.dumps(meta), content_type="application/json")
+    if file is not None:
+        form.add_field("file", io.BytesIO(file), filename="x.bin", content_type="application/octet-stream")
+    return form
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+_FLIPPED = LIB_DATA[:100] + b"\x55" + LIB_DATA[101:]
+_NOT_ICE40 = b"\x00" * 4096
+# One case per row of the spec's check table (section 2, POST /library/{id}), first failure first.
+PUSH_CHECKS = {
+    "not_an_fpga_board": dict(who=IS_OTHER, status=404, error="not an fpga board"),
+    "not_identified_yet": dict(who=NOT_NAMED, status=503, error="board not identified yet"),
+    "id_not_a_name": dict(url="Bad-Name", status=404, error="no such design"),
+    "id_too_long": dict(url="a" * 41, status=404, error="no such design"),
+    "not_multipart": dict(body="json", status=400, error=BOTH_PARTS),
+    "no_file_part": dict(file=None, status=400, error=BOTH_PARTS),
+    "no_meta_part": dict(meta=None, status=400, error=BOTH_PARTS),
+    "body_too_large": dict(file=ICE40_PREAMBLE + b"\x01" * (1024 * 1024), status=413, error="request body too large"),
+    "file_too_large": dict(file=ICE40_PREAMBLE + b"\x01" * (256 * 1024), status=400, error="bitstream too large"),
+    "meta_too_long": dict(meta="x" * 4097, status=400, error="meta too long"),
+    "meta_not_json": dict(meta="{not json", status=400, error="meta: not JSON"),
+    "meta_nan": dict(meta=json.dumps(LIB_META)[:-1].replace("4096", "NaN") + "}", status=400, error="meta: not JSON"),
+    "meta_not_an_object": dict(meta="[1, 2]", status=400, error="meta: must be a JSON object"),
+    "meta_extra_key": dict(meta={**LIB_META, "title": ""}, status=400, error="meta: keys must be exactly"),
+    "meta_bool": dict(meta={**LIB_META, "bin_bytes": True}, status=400, error="meta: bin_bytes must be an integer"),
+    "meta_upper_hex": dict(meta={**LIB_META, "bin_sha256": LIB_SHA.upper()}, status=400,
+                           error="meta: bin_sha256 must be 64 lowercase hex digits"),
+    "meta_id_not_the_url": dict(url="other_name", status=400, error="meta.id does not match the URL"),
+    "a_demo_name": dict(url="tt_um_demo_a", meta={**LIB_META, "id": "tt_um_demo_a"}, status=409,
+                        error="tt_um_demo_a is a demo name; pick another"),
+    "the_idle_name": dict(url="idle_display", meta={**LIB_META, "id": "idle_display"}, status=409,
+                          error="idle_display is the daemon's own name for its idle display; pick another"),
+    "size_not_meta": dict(file=LIB_DATA[:-1], status=400, error="bitstream is 4095 bytes, meta says 4096"),
+    "hash_not_meta": dict(file=_FLIPPED, status=400, error="bitstream does not match bin_sha256"),
+    "not_ice40": dict(file=_NOT_ICE40, meta={**LIB_META, "bin_sha256": _sha(_NOT_ICE40)}, status=400,
+                      error="not an iCE40 bitstream (preamble 7E AA 99 7E missing in the first 64 bytes)"),
+}  # fmt: skip
+
+
+def library_app(bridge, tmp_path, who=IS_FPGA, **kwargs):
+    return create_app(bridge, identify=lambda: who, demos_dir=DEMOS, uploads_dir=tmp_path / "pi-uploads",
+                      library_dir=tmp_path / "pi-library", **kwargs)  # fmt: skip
+
+
+@pytest.mark.parametrize("case", list(PUSH_CHECKS), ids=list(PUSH_CHECKS))
+async def test_push_checks(aiohttp_client, bridge, fake_repl, tmp_path, case):
+    c = dict(PUSH_CHECKS[case])
+    client = await aiohttp_client(library_app(bridge, tmp_path, who=c.get("who", IS_FPGA)))
+    url = f"/library/{c.get('url', LIB_ID)}"
+    if c.get("body") == "json":
+        resp = await client.post(url, json=LIB_META)
+    else:
+        resp = await client.post(url, data=push_form(c.get("meta", LIB_META), c.get("file", LIB_DATA)))
+    assert resp.status == c["status"], await resp.text()
+    error = (await resp.json())["error"]
+    assert error.startswith(c["error"]), error
+    assert library.entries(tmp_path / "pi-library") == []  # nothing kept
+    assert fake_repl.transcript == b""  # and the board never asked
+
+
+async def test_push_created_then_idempotent_200(fpga_client, fake_repl, tmp_path):
+    lib = tmp_path / "pi-library"
+    resp = await fpga_client.post(f"/library/{LIB_ID}", data=push_form())
+    assert resp.status == 201, await resp.text()
+    body = {"id": LIB_ID, "bin_bytes": 4096, "bin_sha256": LIB_SHA, "evicted": [], "hides_upload": False}
+    assert await resp.json() == body
+    assert library.bin_path(lib, LIB_ID).read_bytes() == LIB_DATA
+    os.utime(lib / f"{LIB_ID}.json", (1000, 1000))
+    resp = await fpga_client.post(f"/library/{LIB_ID}", data=push_form())
+    assert resp.status == 200 and await resp.json() == body
+    assert (lib / f"{LIB_ID}.json").stat().st_mtime > 1000  # the LRU time is refreshed
+    assert fake_repl.transcript == b""  # a push never touches the board
+
+
+async def test_push_evicts_the_oldest_and_says_so(aiohttp_client, bridge, fake_repl, tmp_path):
+    c = await aiohttp_client(library_app(bridge, tmp_path, library_max_bytes=4096))
+    first, second = ENTRIES[0], ENTRIES[1]
+    assert (await c.post(f"/library/{first[0]}", data=push_form(
+        {"id": first[0], "bin_sha256": first[1], "bin_bytes": 4096}, first[2]))).status == 201  # fmt: skip
+    resp = await c.post(f"/library/{LIB_ID}", data=push_form())
+    assert resp.status == 201 and (await resp.json())["evicted"] == [first[0]]
+    assert second[0] == LIB_ID and library.names(tmp_path / "pi-library") == {LIB_ID}
+
+
+async def test_a_push_that_cannot_be_kept_is_a_json_500(fpga_client, monkeypatch):
+    def no_room(*args):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(library, "store", no_room)
+    resp = await fpga_client.post(f"/library/{LIB_ID}", data=push_form())
+    assert resp.status == 500 and resp.content_type == "application/json"
+    assert await resp.json() == {"error": "the library entry could not be kept on the Pi", "detail": "OSError"}
+
+
+async def test_push_reports_hides_upload(fpga_client, tmp_path):
+    form = aiohttp.FormData()
+    form.add_field("name", LIB_ID)
+    form.add_field("file", ICE40_PREAMBLE + b"an upload made before the index existed", filename="x.bin")
+    assert (await fpga_client.post("/bitstream", data=form)).status == 201
+    resp = await fpga_client.post(f"/library/{LIB_ID}", data=push_form())
+    assert resp.status == 201 and (await resp.json())["hides_upload"] is True
+    listed = [d for d in (await (await fpga_client.get("/designs")).json())["designs"] if d["name"] == LIB_ID]
+    assert [d["source"] for d in listed] == ["library"]  # listed once, as what a load would load
+    # and a new upload may not take a cached library id
+    form = aiohttp.FormData()
+    form.add_field("name", LIB_ID)
+    form.add_field("file", ICE40_PREAMBLE + b"another", filename="x.bin")
+    resp = await fpga_client.post("/bitstream", data=form)
+    assert resp.status == 409
+    assert (await resp.json())["error"] == f"{LIB_ID} is a VGA library design; pick another"
+
+
+async def test_push_counts_as_activity(aiohttp_client, bridge, fake_repl, tmp_path):
+    app = library_app(bridge, tmp_path)
+    c = await aiohttp_client(app)
+    before = app["activity"].last
+    await asyncio.sleep(0.01)
+    assert (await c.post(f"/library/{LIB_ID}", data=push_form())).status == 201
+    assert app["activity"].last > before
+
+
+async def test_get_library(aiohttp_client, bridge, fake_repl, tmp_path):
+    app = library_app(bridge, tmp_path, library_max_bytes=1 << 20)
+    c = await aiohttp_client(app)
+    assert await (await c.get("/library")).json() == {"max_bytes": 1 << 20, "used_bytes": 0, "entries": []}
+    library.store(tmp_path / "pi-library", LIB_ID, LIB_SHA, LIB_DATA, 1 << 20)
+    app["taken"].take()  # the idle display has the board: /library does not wait for it
+    try:
+        resp = await asyncio.wait_for(c.get("/library"), 2)
+    finally:
+        app["taken"].release()
+    body = await resp.json()
+    assert body["max_bytes"] == 1 << 20 and body["used_bytes"] == 4096
+    [entry] = body["entries"]
+    assert set(entry) == {"id", "bin_sha256", "bin_bytes", "used_at"}
+    assert (entry["id"], entry["bin_sha256"], entry["bin_bytes"]) == (LIB_ID, LIB_SHA, 4096)
+    assert fake_repl.transcript == b""  # never touches the REPL
+
+
+async def test_designs_has_top_level_library_key(aiohttp_client, bridge, fake_repl, tmp_path):
+    c = await aiohttp_client(library_app(bridge, tmp_path, library_max_bytes=1 << 20))
+    body = await (await c.get("/designs")).json()
+    assert list(body) == ["enabled", "library", "designs"]
+    assert body["library"] == {"max_bytes": 1 << 20, "used_bytes": 0}
+    assert (await c.post(f"/library/{LIB_ID}", data=push_form())).status == 201
+    body = await (await c.get("/designs")).json()
+    assert body["library"] == {"max_bytes": 1 << 20, "used_bytes": 4096}
+    assert body["designs"][-1] == {
+        "name": LIB_ID, "title": "", "author": "", "description": "", "docs_url": "", "repo_url": "",
+        "clock_hz": None, "pinout": {}, "source": "library", "size": 4096,
+    }  # fmt: skip
+    resp = await c.post(f"/designs/{LIB_ID}/enable", json={"clock_hz": 25_175_000})
+    assert resp.status == 200, await resp.text()
+    assert fake_repl.loaded[-1] == (f"pi:{LIB_ID}.bin", LIB_DATA)
+    assert (await (await c.get("/designs")).json())["enabled"] == LIB_ID
+
+
+async def test_enable_of_an_evicted_library_entry_is_404(aiohttp_client, bridge, fake_repl, tmp_path):
+    c = await aiohttp_client(library_app(bridge, tmp_path, library_max_bytes=4096))
+    assert (await c.post(f"/library/{LIB_ID}", data=push_form())).status == 201
+    other = ENTRIES[2]
+    meta = {"id": other[0], "bin_sha256": other[1], "bin_bytes": 4096}
+    assert (await (await c.post(f"/library/{other[0]}", data=push_form(meta, other[2]))).json())["evicted"] == [LIB_ID]
+    resp = await c.post(f"/designs/{LIB_ID}/enable")
+    assert resp.status == 404 and (await resp.json())["error"] == "no such design"
+
+
+def test_cli_library_flags(monkeypatch, tmp_path):
+    monkeypatch.delenv(library.MAX_BYTES_ENV, raising=False)
+    args = build_parser().parse_args([])
+    assert args.library_dir == "/var/lib/fpgas-tt/library"  # the service's StateDirectory, beside the uploads
+    assert args.library_max_bytes is None  # main() asks library.max_bytes_default()
+    args = build_parser().parse_args(["--library-dir", str(tmp_path), "--library-max-bytes", "4096"])
+    assert args.library_dir == str(tmp_path) and args.library_max_bytes == 4096
+    for bad in ("0", "lots", "-1"):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--library-max-bytes", bad])
+
+    captured = {}
+    monkeypatch.setattr("fpgas_tt.server.web.run_app", lambda app, **kwargs: captured.update(app=app))
+    monkeypatch.setattr(identity, "usb_serial_for_tty", lambda device: SERIAL)
+    report = _report(tmp_path, [FPGA_BOARD])
+    argv = ["--device", "/dev/null", "--report", str(report), "--idle-design", ""]
+    assert main(argv) == 0
+    assert captured["app"]["library_dir"] == Path("/var/lib/fpgas-tt/library")
+    assert captured["app"]["library_max_bytes"] == 16777216
+    monkeypatch.setenv(library.MAX_BYTES_ENV, "1048576")  # the infra drop-in's Environment=
+    assert main(argv) == 0 and captured["app"]["library_max_bytes"] == 1048576
+    assert main([*argv, "--library-max-bytes", "8192", "--library-dir", str(tmp_path)]) == 0  # the flag wins
+    assert captured["app"]["library_max_bytes"] == 8192 and captured["app"]["library_dir"] == tmp_path
+    monkeypatch.setenv(library.MAX_BYTES_ENV, "lots")
+    with pytest.raises(SystemExit):
+        main(argv)
+
+
+def test_create_app_library_defaults(monkeypatch):
+    monkeypatch.setenv(library.MAX_BYTES_ENV, "65536")
+    app = create_app(Bridge("/dev/null"), identify=lambda: IS_FPGA)
+    assert app["library_dir"] == Path("/var/lib/fpgas-tt/library") and app["library_max_bytes"] == 65536
+
+
+# The upload route's limits, run again now that it reads its parts through the helper it shares with the push.
+UPLOAD_LIMITS = {
+    "body_over_the_total": dict(fields=[("name", b"too_big"), ("file", ICE40_PREAMBLE + b"\x01" * (1024 * 1024))],
+                                chunked=False, status=413, error="request body too large"),
+    "chunked_name_too_long": dict(fields=[("name", b"x" * (MULTIPART_NAME_MAX_BYTES + 1)),
+                                          ("file", ICE40_PREAMBLE + b"\x01" * 100)],
+                                  chunked=True, status=400, error="name too long"),
+    "junk_parts_over_the_total": dict(fields=[(f"junk{i}", b"j" * 70_000) for i in range(6)], chunked=True,
+                                      status=413, error="request body too large"),
+    "file_over_its_cap": dict(fields=[("name", b"my_design"), ("file", ICE40_PREAMBLE + b"\x01" * (256 * 1024))],
+                              chunked=True, status=400, error="bitstream too large (limit 262144 bytes)"),
+    "no_fields": dict(fields=[], chunked=False, status=400,
+                      error="multipart form with fields 'name' and 'file' required"),
+    "no_file": dict(fields=[("name", b"my_design")], chunked=False, status=400,
+                    error="fields 'name' and 'file' are required"),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("case", list(UPLOAD_LIMITS), ids=list(UPLOAD_LIMITS))
+async def test_bitstream_upload_unchanged_after_part_reader_move(fpga_client, fake_repl, tmp_path, case):
+    c = UPLOAD_LIMITS[case]
+    form = aiohttp.FormData()
+    for name, value in c["fields"]:
+        form.add_field(name, io.BytesIO(value), filename="x.bin" if name == "file" else None)
+    resp = await fpga_client.post("/bitstream", data=form, chunked=c["chunked"] or None)
+    assert resp.status == c["status"], await resp.text()
+    assert (await resp.json())["error"].startswith(c["error"])
+    assert not (tmp_path / "pi-uploads").exists() or list((tmp_path / "pi-uploads").iterdir()) == []
+    assert fake_repl.transcript == b""

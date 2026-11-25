@@ -6,10 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from fpgas_tt import designs
+from fpgas_tt import designs, library
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.designs import ValidationError, validate_bitstream
 from fpgas_tt.repl import ReplError, ReplRunner
+from tests.test_library import ENTRIES
 
 DEMOS = Path(__file__).parent / "data" / "demos"
 PRE = b"\x7e\xaa\x99\x7e"
@@ -169,7 +170,7 @@ def test_uploads_at_the_same_time_do_not_trip_over_each_others_evictions(uploads
 
 
 async def test_an_upload_removed_before_it_is_read_is_not_found(runner, fake_repl, uploads, monkeypatch):
-    monkeypatch.setattr(designs, "design_file", lambda demos_dir, uploads_dir, name: uploads / "evicted.bin")
+    monkeypatch.setattr(designs, "design_file", lambda demos_dir, uploads_dir, name, **kw: uploads / "evicted.bin")
     with pytest.raises(designs.DesignNotFound):
         await designs.enable_design(runner, "evicted", None, DEMOS, uploads)
     assert fake_repl.transcript == b""
@@ -471,3 +472,92 @@ async def test_the_fake_board_refuses_what_the_daemon_used_to_send(runner, fake_
 )
 def test_the_guard_sees_how_the_daemon_used_to_write_to_the_board(source):
     assert [text for text in sent_to_the_board(source) if BOARD_WRITE.search(text)], source
+
+
+# -- the VGA library: a third source, between the demos and the uploads --
+
+
+@pytest.fixture
+def lib(tmp_path) -> Path:
+    return tmp_path / "pi-library"
+
+
+def test_precedence_demo_then_library_then_upload(uploads, lib):
+    id, sha, data = ENTRIES[1]
+    designs.store_upload(uploads, id, PRE + b"an upload made before the index existed")
+    assert designs.design_file(DEMOS, uploads, id, library_dir=lib) == uploads / f"{id}.bin"
+    library.store(lib, id, sha, data, 1 << 20)
+    assert designs.design_file(DEMOS, uploads, id, library_dir=lib) == library.bin_path(lib, id)  # over the upload
+    # a demo wins over a library entry of its name (a push refuses one: this one is put there by hand)
+    library.store(lib, "tt_um_demo_a", sha, data, 1 << 20)
+    assert designs.design_file(DEMOS, uploads, "tt_um_demo_a", library_dir=lib) == DEMOS / "tt_um_demo_a.bin"
+    assert designs.design_names(DEMOS, uploads, library_dir=lib) == sorted([id, "tt_um_demo_a", "tt_um_demo_b"])
+    # without a library, as before
+    assert designs.design_file(DEMOS, uploads, id) == uploads / f"{id}.bin"
+    assert designs.design_names(DEMOS, uploads) == sorted([id, "tt_um_demo_a", "tt_um_demo_b"])
+    for name in ("nope", "Not A Valid Name!", "../etc/passwd", ""):
+        with pytest.raises(designs.DesignNotFound):
+            designs.design_file(DEMOS, uploads, name, library_dir=lib)
+
+
+def test_upload_refused_for_cached_library_id():
+    with pytest.raises(ValidationError) as ei:
+        validate_bitstream("ttsky25a_vga_example", PRE, {"tt_um_demo_a"}, library_names={"ttsky25a_vga_example"})
+    assert ei.value.status == 409
+    assert str(ei.value) == "ttsky25a_vga_example is a VGA library design; pick another"
+    validate_bitstream("my_design", PRE, {"tt_um_demo_a"}, library_names={"ttsky25a_vga_example"})
+
+
+@pytest.mark.parametrize("name,msg", [("tt_um_demo_a", "is a demo name"), ("idle_display", "idle display")])
+def test_check_name_free_is_validate_bitstreams_own_rule(name, msg):
+    for check in (lambda: designs.check_name_free(name, {"tt_um_demo_a"}),
+                  lambda: validate_bitstream(name, PRE, {"tt_um_demo_a"})):  # fmt: skip
+        with pytest.raises(ValidationError, match=msg) as ei:
+            check()
+        assert ei.value.status == 409
+    designs.check_name_free("my_design", {"tt_um_demo_a"})
+
+
+async def test_listing_reports_library_entries_in_upload_shape_with_size(runner, fake_repl, uploads, lib):
+    designs.store_upload(uploads, "my_upload", PRE)
+    id, sha, data = ENTRIES[1]
+    library.store(lib, id, sha, data, 1 << 20)
+    body = await designs.list_designs(runner, DEMOS, uploads, library_dir=lib)
+    assert [d["name"] for d in body["designs"]] == ["my_upload", "tt_um_demo_a", "tt_um_demo_b", id]
+    assert body["designs"][-1] == {
+        "name": id, "title": "", "author": "", "description": "", "docs_url": "", "repo_url": "",
+        "clock_hz": None, "pinout": {}, "source": "library", "size": 4096,
+    }  # fmt: skip
+    assert body["designs"][0]["source"] == "upload" and "size" not in body["designs"][0]
+    assert body["designs"][1]["source"] == "demo" and "size" not in body["designs"][1]
+    # without a library, as before
+    assert [d["name"] for d in (await designs.list_designs(runner, DEMOS, uploads))["designs"]] == [
+        "my_upload", "tt_um_demo_a", "tt_um_demo_b"]  # fmt: skip
+
+
+async def test_enabled_library_design_not_in_cache_still_lists_enabled(runner, fake_repl, uploads, lib):
+    id, sha, data = ENTRIES[1]
+    library.store(lib, id, sha, data, 4096)
+    await designs.enable_design(runner, id, None, DEMOS, uploads, library_dir=lib)
+    library.store(lib, *ENTRIES[2], 4096)  # evicts it
+    body = await designs.list_designs(runner, DEMOS, uploads, library_dir=lib)
+    assert body["enabled"] == id  # what the board says, whatever the Pi still keeps
+    assert id not in [d["name"] for d in body["designs"]]
+
+
+async def test_enable_reads_library_bin_and_touches_lru(runner, fake_repl, uploads, lib):
+    id, sha, data = ENTRIES[0]
+    library.store(lib, id, sha, data, 1 << 20)
+    os.utime(lib / f"{id}.json", (1000, 1000))
+    out = await designs.enable_design(runner, id, 25_175_000, DEMOS, uploads, library_dir=lib)
+    assert out == {"enabled": id, "clock_hz": 25_175_000}
+    assert fake_repl.loaded == [(f"pi:{id}.bin", data)]
+    assert (lib / f"{id}.json").stat().st_mtime > 1000
+
+
+async def test_a_library_entry_evicted_before_the_enable_is_not_found(runner, fake_repl, uploads, lib):
+    library.store(lib, *ENTRIES[0], 4096)
+    library.store(lib, *ENTRIES[1], 4096)  # evicts ENTRIES[0]
+    with pytest.raises(designs.DesignNotFound):
+        await designs.enable_design(runner, ENTRIES[0][0], None, DEMOS, uploads, library_dir=lib)
+    assert fake_repl.transcript == b""
