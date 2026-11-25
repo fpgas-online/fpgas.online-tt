@@ -3,15 +3,15 @@ comes back.
 
 fpgas.online-test-designs issue #181: at every start the SDK (2.0.4) loads its default project, the chip's
 ``tt_um_factory_test``, with the board's own ``config.ini`` section for it: ``clock_frequency = 10`` and
-``ui_in = 1``, in ASIC_RP_CONTROL mode, where the RP2040 drives ``ui_in``. With ``ui_in[0]`` high the factory test
+``ui_in = 1``, in ASIC_RP_CONTROL mode, where the RP chip drives ``ui_in``. With ``ui_in[0]`` high the factory test
 drives its counter onto ``uio`` (``uio_oe = 0xff``). The Pi's Pmod HAT makes one net of each of ui_in[1:3] and
-uio[1:3] (HAT JA2-4 and JB2-4 are the same Pi GPIOs 10, 9 and 11), so the RP2040 driving ``ui_in[1:3]`` low and
+uio[1:3] (HAT JA2-4 and JB2-4 are the same Pi GPIOs 10, 9 and 11), so the RP chip driving ``ui_in[1:3]`` low and
 the chip driving its counter bits fight on those three nets, from power-on. Tim, 2026-10-08 (tt-6): "Both (b) and
 (c)": (b) each chip board's ``config.ini`` is changed (his word for that write, done by hand, board by board) and
 (c) this: the daemon sets a safe state in RAM.
 
-The safe state: the project clock stopped (its pin released), the RP2040's own ``uio`` pins released
-(``uio_oe_pico`` 0, all inputs), and ``ui_in`` driven to 0 by the RP2040, so the factory test leaves ``uio`` as
+The safe state: the project clock stopped (its pin released), the RP chip's own ``uio`` pins released
+(``uio_oe_pico`` 0, all inputs), and ``ui_in`` driven to 0 by the RP chip, so the factory test leaves ``uio`` as
 inputs and copies it to ``uo_out``. Then no net of the HAT has two drivers: the daemon drives none of the Pi's
 GPIOs. ``ui_in``'s direction is set too, not only its value: the boot check's wiring test leaves the ui_in pins as
 inputs with no pull (fpgas.online-test-designs issue #196), behind the SDK's back (its pins keep the mode it last
@@ -19,7 +19,8 @@ set), and the SDK's ``ui_in.value`` only sets the output register. As the SDK do
 guard for the DIP switches), each ui_in pin is made an input with the SDK's pull-down, whatever the SDK believes it
 is, and is driven only if it then reads low, ``ui_in[0]`` first (with it low the chip lets go of
 ``uio``, and so of ui_in[1:3] through the HAT). A pin still held high, by a DIP switch that is on, is left an
-input and said. Which pins are driven is read back from the RP2040's GPIO_OE register, not from the SDK. Nothing
+input and said. Which pins are driven is read back from the chip's GPIO_OE (``rpregs.GPIO_OE_EXPR``, chosen by
+SYSINFO PART), not from the SDK. Nothing
 is written to a file on the board (Tim, 2026-10-05); the state lasts until the board's SDK
 starts again.
 
