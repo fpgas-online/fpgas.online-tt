@@ -52,6 +52,7 @@ from aiohttp import web
 
 from fpgas_tt import designs, identity, idle
 from fpgas_tt.repl import ReplBusy, ReplError, ReplNoBoard
+from fpgas_tt.rpregs import GPIO_OE_EXPR
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ SAFE_CODE = (
     "                continue\n"
     "            _fo_p.mode = Pin.OUT\n"
     "        time.sleep_ms(5)\n"
-    "        _fo_oe = machine.mem32[0xd0000020]\n"  # SIO GPIO_OE: which pins the RP2040 drives, from the hardware
+    "        _fo_oe = machine.mem32[" + GPIO_OE_EXPR + "]\n"  # SIO GPIO_OE: which pins the chip drives
     "        _fo_r['clock'] = _fo_tt.auto_clocking_freq if _fo_tt.is_auto_clocking else 0\n"
     "        _fo_r['ui_in'] = int(_fo_tt.ui_in.value)\n"
     "        _fo_r['uio_oe'] = int(_fo_tt.uio_oe_pico.value)\n"

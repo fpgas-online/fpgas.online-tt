@@ -304,6 +304,10 @@ class FakeTT:
         return self.clock_hz
 
 
+CHIP_PART = {"rp2040": 2, "rp2350": 4}
+GPIO_OE_ADDRESS = {"rp2040": 0xD0000020, "rp2350": 0xD0000030}
+
+
 @dataclass
 class FakeRepl:
     """Drive the pty master like a MicroPython board in raw-REPL mode."""
@@ -313,6 +317,7 @@ class FakeRepl:
     echo_junk: bytes = b""  # bytes "someone else" injects after the banner (interference tests)
     raw_preamble: bytes = DEFAULT_RAW_PREAMBLE  # pre-banner echo a real board sends; tests may override/blow it up
     transcript: bytearray = field(default_factory=bytearray)
+    chip: str = "rp2350"  # "rp2040" or "rp2350": which SIO and SYSINFO registers the board has
 
     def __post_init__(self) -> None:
         self.fos = _FakeOs(self.root)
@@ -346,7 +351,9 @@ class FakeRepl:
 
         class Mem32:  # machine.mem32, as far as the daemon reads it
             def __getitem__(self, addr):
-                if addr == 0xD0000020:
+                if addr == 0x40000000:  # SYSINFO CHIP_ID: PART in bits 27:12
+                    return (CHIP_PART[repl.chip] << 12) | 0x927
+                if addr == GPIO_OE_ADDRESS[repl.chip]:  # the other chip's address is not read
                     return repl.tt.gpio_oe()
                 raise AssertionError(f"the daemon read mem32[{addr:#x}], which the fake board does not have")
 
