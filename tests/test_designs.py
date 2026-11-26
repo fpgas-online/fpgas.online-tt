@@ -720,9 +720,9 @@ async def test_release_reports_two_lists(runner, fake_repl, uploads, lib):
     assert fake_repl.chip == "rp2350"
     id, sha, data = ENTRIES[1]
     library.store(lib, id, sha, data, 1 << 20)
-    first = await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads, library_dir=lib,
-                                        ui_in=1, ui_in_mask=1)  # fmt: skip
-    assert (first["released"], first["ui_in_inputs"], first["ui_in_driven"]) == ([], [], [0])
+    other = _stored(lib, 0)
+    first = await designs.enable_design(runner, other, None, DEMOS, uploads, library_dir=lib, ui_in=1, ui_in_mask=1)
+    assert (first["released"], first["ui_in_inputs"], first["ui_in_driven"]) == ([], [1, 2, 3, 4, 5, 6, 7], [0])
     assert fake_repl._globals["_fo_ui_driven"] == [0]
     outputs, latches = len(fake_repl.tt.made_outputs), len(fake_repl.tt.latch_writes)
     out = await designs.enable_design(runner, id, None, DEMOS, uploads, library_dir=lib, ui_in=1, ui_in_mask=1)
@@ -742,22 +742,35 @@ async def test_release_reports_two_lists(runner, fake_repl, uploads, lib):
     assert _pins(fake_repl) == [(0, 2)] * 8 and fake_repl._globals["_fo_ui_driven"] == []
 
 
-async def test_release_frees_only_daemon_driven_pins(runner, fake_repl, uploads):
-    await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads, ui_in=1, ui_in_mask=1)
+def _stored(lib: Path, k: int = 1) -> str:
+    """Library entry ENTRIES[k], kept in `lib`: its id."""
+    library.store(lib, *ENTRIES[k], 1 << 20)
+    return ENTRIES[k][0]
+
+
+async def _drive_bit_0(runner, uploads, lib) -> None:
+    """A library load that drives ui_in[0] high (and makes ui_in[1:7] inputs)."""
+    out = await designs.enable_design(runner, _stored(lib), None, DEMOS, uploads, library_dir=lib, ui_in=1,
+                                      ui_in_mask=1)  # fmt: skip
+    assert out["ui_in_driven"] == [0]
+
+
+async def test_release_frees_only_daemon_driven_pins(runner, fake_repl, uploads, lib):
+    await _drive_bit_0(runner, uploads, lib)
     # the visitor's own write_ui_in, through the Commander, sets bit 1: the chip drives it high
     tt = fake_repl.tt
     tt.ui_pin(1).mode = 1
     tt.ui_in.value = tt.ui_out | 0b10
     latches = len(tt.latch_writes)
-    out = await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
+    out = await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads, library_dir=lib)
     assert (out["released"], out["ui_in_inputs"], out["ui_in_driven"], out["ui_in_held"]) == ([0], [], [], [])
     assert tt.latch_writes[latches:] == [(0, 0)]  # only bit 0 discharged
     assert tt.ui_pin(1).hw_mode == 1 and tt.ui_out >> 1 & 1 and tt.ui_level(1) == 1  # bit 1 untouched
     assert _pins(fake_repl)[0] == (0, 2)
 
 
-async def test_a_released_pin_the_chip_no_longer_drives_is_not_made_an_output(runner, fake_repl, uploads):
-    await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads, ui_in=1, ui_in_mask=1)
+async def test_a_released_pin_the_chip_no_longer_drives_is_not_made_an_output(runner, fake_repl, uploads, lib):
+    await _drive_bit_0(runner, uploads, lib)
     fake_repl.tt.ui_pin(0).hw_mode = 0  # something let go of it behind the daemon's back
     outputs, latches = len(fake_repl.tt.made_outputs), len(fake_repl.tt.latch_writes)
     out = await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
@@ -775,18 +788,20 @@ async def test_release_exception_keeps_enabled_name(runner, fake_repl, uploads):
     assert [name for name, _ in fake_repl.loaded] == ["pi:tt_um_demo_a.bin"]  # the FPGA was never touched
 
 
-async def test_a_held_mask_bit_is_left_an_input(runner, fake_repl, uploads):
+async def test_a_held_mask_bit_is_left_an_input(runner, fake_repl, uploads, lib):
     fake_repl.tt.dip_on, fake_repl.tt.counter = {2}, 0  # an FPGA board: no factory test on uio
-    out = await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads, ui_in=0b101, ui_in_mask=0b111)
+    out = await designs.enable_design(runner, _stored(lib), None, DEMOS, uploads, library_dir=lib, ui_in=0b101,
+                                      ui_in_mask=0b111)  # fmt: skip
     assert (out["ui_in_driven"], out["ui_in_held"]) == ([0, 1], [2])
     assert fake_repl._globals["_fo_ui_driven"] == [0, 1]
 
 
-async def test_a_failed_load_drives_nothing(runner, fake_repl, uploads, monkeypatch):
+async def test_a_failed_load_drives_nothing(runner, fake_repl, uploads, lib, monkeypatch):
     monkeypatch.setattr(fake_repl.loader, "spi_transferPIO", lambda filepath, freq=1_000_000: None)
     outputs = len(fake_repl.tt.made_outputs)
     with pytest.raises(ReplError):
-        await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads, ui_in=1, ui_in_mask=1)
+        await designs.enable_design(runner, _stored(lib), None, DEMOS, uploads, library_dir=lib, ui_in=1,
+                                    ui_in_mask=1)  # fmt: skip
     assert fake_repl.tt.made_outputs[outputs:] == [] and fake_repl._globals["_fo_ui_driven"] == []
 
 
@@ -797,3 +812,21 @@ async def test_a_damaged_driven_list_does_not_wedge_later_loads(runner, fake_rep
     assert out["released"] == [0] and fake_repl._globals["_fo_ui_driven"] == []
     out = await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
     assert out["released"] == [] and (await designs.list_designs(runner, DEMOS, uploads))["enabled"] == "tt_um_demo_b"
+
+
+@pytest.mark.parametrize(
+    "ui_in,mask,given", [(1, 1, True), (None, 0, True), (None, 1, False), (0, 0, False)]
+)
+@pytest.mark.parametrize("source", ["demo", "upload"])
+async def test_ui_in_is_only_for_library_designs(runner, fake_repl, uploads, lib, source, ui_in, mask, given):
+    """Ruling BA: ui_in is tied to uio on the Welland HAT; only a library entry's published mask may drive it."""
+    name = "tt_um_demo_a"
+    if source == "upload":
+        name = "my_upload"
+        designs.store_upload(uploads, name, PRE)
+    _stored(lib)
+    with pytest.raises(ValidationError) as ei:
+        await designs.enable_design(runner, name, None, DEMOS, uploads, library_dir=lib, ui_in=ui_in,
+                                    ui_in_mask=mask, ui_in_given=given)  # fmt: skip
+    assert (ei.value.status, str(ei.value)) == (400, "ui_in is only for VGA library designs")
+    assert fake_repl.transcript == b""  # refused before the board was asked

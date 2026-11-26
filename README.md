@@ -129,7 +129,11 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   bit outside the mask, a mask other than 0 needs a `ui_in`, and a mask of 0
   needs `ui_in` null. The caller
   always supplies them (the site reads a library entry's from its index); the
-  daemon never fills them in.
+  daemon never fills them in. They are only for a VGA library entry: an
+  enable of a demo or an upload whose body has either key, even null or 0,
+  is refused with `400 ui_in is only for VGA library designs` before the
+  board is asked. The `ui_in` pins share nets with `uio` on the Welland HAT,
+  so only a mask the harness published may drive them.
 
   | Pins | Condition | Steps |
   |------|-----------|-------|

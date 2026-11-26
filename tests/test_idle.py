@@ -8,11 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from fpgas_tt import designs, idle, repl
+from fpgas_tt import designs, idle, library, repl
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.repl import ReplBusy, ReplError
 from fpgas_tt.server import build_parser, create_app
 from tests.test_designs import PRE, board_tree, wait_for
+from tests.test_library import ENTRIES
 from tests.test_server import DEMOS, IS_FPGA, IS_OTHER, NOT_NAMED
 
 MOVING = PRE + b"a design that animates the display from the FPGA's own oscillator" * 40
@@ -514,7 +515,9 @@ def test_the_daemons_defaults_are_the_boot_checks_file_a_minute_and_no_replacing
 async def test_idle_display_load_releases_too(bridge, fake_repl, tmp_path, design):
     """The idle display's own load releases the ui_in pins the daemon drove for the design before it."""
     app = an_app(bridge, tmp_path)
-    await designs.enable_design(app["repl"], "tt_um_demo_a", None, DEMOS, tmp_path / "pi-uploads",
+    lib = tmp_path / "pi-library"
+    library.store(lib, *ENTRIES[1], 1 << 20)
+    await designs.enable_design(app["repl"], ENTRIES[1][0], None, DEMOS, tmp_path / "pi-uploads", library_dir=lib,
                                 ui_in=1, ui_in_mask=1)  # fmt: skip
     assert fake_repl._globals["_fo_ui_driven"] == [0] and fake_repl.tt.ui_pin(0).hw_mode == 1
     show = idle.IdleDisplay(app, design=design, after=60, replace_after=60)

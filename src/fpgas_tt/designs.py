@@ -58,6 +58,9 @@ ENABLE_LEAST = 8.0
 # It is not a design of the Pi's gallery, so no upload may take it: a page marks as running the listed design
 # whose name the SDK gives.
 IDLE_NAME = "idle_display"
+# Ruling BA: ui_in pins are tied to uio on the Welland HAT, so only a library entry, whose mask the harness
+# published, may have them driven.
+UI_IN_LIBRARY_ONLY = "ui_in is only for VGA library designs"
 
 class ValidationError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
@@ -463,14 +466,19 @@ async def enable_design(
     library_dir: Path | None = None,
     ui_in: int | None = None,
     ui_in_mask: int = 0,
+    ui_in_given: bool = False,
     waited: float = 0.0,
 ) -> dict:
     """Load design `name`. `waited` is what the caller already spent waiting for the board: it comes out of
     the deadline, which is the caller's whole request's, the start of the SDK included. `ui_in` and
     `ui_in_mask` are the caller's (the server has checked them): a library entry gets the release of every bit
-    outside its mask."""
+    outside its mask. They are only for a library entry (Ruling BA): for a demo or an upload, any value, or
+    `ui_in_given` (the request carried either key, even as null or 0), is a ValidationError before the board
+    is touched."""
     # design_file refuses a name the Pi could never have before anything goes near the board.
     data, is_library = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name, library_dir)
+    if not is_library and (ui_in_given or ui_in is not None or ui_in_mask):
+        raise ValidationError(UI_IN_LIBRARY_ONLY)
     started = time.monotonic() - waited
     if ENABLE_OVERALL_TIMEOUT - waited < ENABLE_LEAST:
         raise ReplBusy("the board was busy for too long; try again")

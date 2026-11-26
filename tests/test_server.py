@@ -765,8 +765,9 @@ async def test_bitstream_upload_unchanged_after_part_reader_move(fpga_client, fa
         ({}, 200, None),
     ],
 )
-async def test_enable_body_ui_in_rules(fpga_client, fake_repl, body, status, error):
-    resp = await fpga_client.post("/designs/tt_um_demo_a/enable", json=body)
+async def test_enable_body_ui_in_rules(fpga_client, fake_repl, tmp_path, body, status, error):
+    library.store(tmp_path / "pi-library", LIB_ID, LIB_SHA, LIB_DATA, 1 << 20)
+    resp = await fpga_client.post(f"/designs/{LIB_ID}/enable", json=body)
     assert resp.status == status, await resp.text()
     got = await resp.json()
     if error is not None:
@@ -774,6 +775,21 @@ async def test_enable_body_ui_in_rules(fpga_client, fake_repl, body, status, err
         assert fake_repl.transcript == b""  # refused before the board was asked
         return
     ui_in, mask = body.get("ui_in"), body.get("ui_in_mask", 0)
-    assert got == {"enabled": "tt_um_demo_a", "clock_hz": None, "ui_in": ui_in, "ui_in_mask": mask,
-                   "ui_in_driven": [0] if mask else [], "ui_in_held": [], "ui_in_inputs": [],
-                   "released": []}  # fmt: skip
+    assert got == {"enabled": LIB_ID, "clock_hz": None, "ui_in": ui_in, "ui_in_mask": mask,
+                   "ui_in_driven": [0] if mask else [], "ui_in_held": [],
+                   "ui_in_inputs": [i for i in range(8) if not mask >> i & 1], "released": []}  # fmt: skip
+
+
+@pytest.mark.parametrize("body", [{"ui_in": 1, "ui_in_mask": 1}, {"ui_in": None}, {"ui_in_mask": 0},
+                                  {"ui_in": None, "ui_in_mask": 0}, {"clock_hz": 100, "ui_in_mask": 0}])  # fmt: skip
+@pytest.mark.parametrize("name", ["tt_um_demo_a", "my_upload"])
+async def test_enable_refuses_ui_in_for_a_demo_or_an_upload(fpga_client, fake_repl, tmp_path, name, body):
+    """Ruling BA: any ui_in or ui_in_mask key, even null or 0, for anything but a library entry."""
+    designs.store_upload(tmp_path / "pi-uploads", "my_upload", ICE40_PREAMBLE + b"\x01" * 100)
+    library.store(tmp_path / "pi-library", LIB_ID, LIB_SHA, LIB_DATA, 1 << 20)
+    resp = await fpga_client.post(f"/designs/{name}/enable", json=body)
+    assert resp.status == 400
+    assert (await resp.json())["error"] == "ui_in is only for VGA library designs"
+    assert fake_repl.transcript == b""  # never touched the board
+    resp = await fpga_client.post(f"/designs/{LIB_ID}/enable", json=body)  # the same body for a library entry
+    assert resp.status == 200, await resp.text()

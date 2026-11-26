@@ -168,6 +168,8 @@ async def _run(request: web.Request, coro) -> web.Response:
         return _json_error(409, "another task is running")
     except DesignNotFound:
         return _json_error(404, "no such design")
+    except ValidationError as exc:  # refused before the board is touched
+        return _json_error(exc.status, str(exc))
     except ReplError as exc:
         log.warning("task failed: %s: %s", exc, exc.detail[-200:])
         return _json_error(502, "REPL task failed", _sanitize_detail(exc.detail))
@@ -214,6 +216,7 @@ async def designs_enable(request: web.Request) -> web.Response:
         return _json_error(404, "no such design")
     clock_hz = ui_in = None
     ui_in_mask = 0
+    ui_in_given = False
     if request.can_read_body:
         try:
             body = await request.json()
@@ -231,6 +234,8 @@ async def designs_enable(request: web.Request) -> web.Response:
                 return _json_error(400, f"clock_hz must be between {CLOCK_HZ_MIN} and {CLOCK_HZ_MAX}")
         # The caller always supplies ui_in and ui_in_mask (the site, from its library index); the daemon never
         # fills them in. Only the mask's bits are driven, and a mask of 0 drives nothing.
+        # either key at all, even null or 0, is refused for anything but a library entry (Ruling BA)
+        ui_in_given = "ui_in" in body or "ui_in_mask" in body
         ui_in_mask = body.get("ui_in_mask", 0)
         if not _byte(ui_in_mask):
             return _json_error(400, "ui_in_mask must be an integer between 0 and 255")
@@ -250,7 +255,8 @@ async def designs_enable(request: web.Request) -> web.Response:
         return web.json_response(
             await designs.enable_design(
                 app["repl"], request.match_info["name"], clock_hz, app["demos_dir"], app["uploads_dir"],
-                library_dir=app["library_dir"], ui_in=ui_in, ui_in_mask=ui_in_mask, waited=waited,
+                library_dir=app["library_dir"], ui_in=ui_in, ui_in_mask=ui_in_mask,
+                ui_in_given=ui_in_given, waited=waited,
             )  # fmt: skip
         )
 
