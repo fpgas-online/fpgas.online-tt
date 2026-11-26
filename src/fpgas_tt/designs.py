@@ -333,7 +333,8 @@ def ui_in_guard(indent: int, held: str) -> str:
 RELEASE_CODE = (
     "    import machine, time, json\n"
     "    from machine import Pin\n"
-    "    _fo_prev = list(globals().get('_fo_ui_driven') or [])\n"
+    # only ints 0..7: a list damaged by hand cannot wedge every later load
+    "    _fo_prev = [i for i in (globals().get('_fo_ui_driven') or []) if isinstance(i, int) and 0 <= i < 8]\n"
     "    _fo_oe = machine.mem32[" + GPIO_OE_EXPR + "]\n"
     "    for _fo_i in _fo_prev:\n"
     "        _fo_p = getattr(tt.pins, 'ui_in%d' % _fo_i)\n"
@@ -529,8 +530,12 @@ async def load_design(
     released = _line(lines, "released=", outs[-1])
     if released is None:
         raise ReplError("the board did not say which ui_in pins it released", outs[-1])
-    driven = _line(lines, "ui_in=", outs[-1]) or {"driven": [], "held": []}
+    driven = _line(lines, "ui_in=", outs[-1])
+    if driven is None:
+        if ui_in is not None and ui_in_mask:  # a drive block was sent: it must have answered
+            raise ReplError("the board did not say which ui_in pins it drives", outs[-1])
+        driven = {"driven": [], "held": []}
     return {"released": _bits(released.get("released"), "released", outs[-1]),
             "ui_in_driven": _bits(driven.get("driven"), "drives", outs[-1]),
             "ui_in_held": _bits(driven.get("held"), "left as inputs", outs[-1]),
-            "ui_in_inputs": _bits(released.get("inputs"), "released", outs[-1])}  # fmt: skip
+            "ui_in_inputs": _bits(released.get("inputs"), "made inputs", outs[-1])}  # fmt: skip

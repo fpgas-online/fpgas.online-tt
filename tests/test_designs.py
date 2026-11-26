@@ -625,7 +625,7 @@ def test_release_discharges_only_daemon_driven_pins():
 def test_library_release_includes_unmasked_bits():
     def extra(**kwargs) -> str:
         step = designs._load_steps("x", D, None, **kwargs)[-1]
-        assert "_fo_prev = list(globals().get('_fo_ui_driven') or [])" in step  # _fo_ui_driven, always
+        assert "globals().get('_fo_ui_driven')" in step  # _fo_ui_driven, always
         return _between(step, "    _fo_inputs = [_fo_i for _fo_i in ", " if _fo_i not in _fo_prev]")
 
     assert extra(ui_in=1, ui_in_mask=1, library=True).endswith("[1, 2, 3, 4, 5, 6, 7]")
@@ -704,6 +704,12 @@ async def test_load_design_parses_released_driven_held(monkeypatch):
                 'released={"released": [], "inputs": []}\r\nui_in=[0]\r\nenabled\r\n'):  # fmt: skip
         with pytest.raises(ReplError):
             await designs.load_design(_Says(bad), "x", D, None)
+    # a drive block was sent, so its answer line is required
+    with pytest.raises(ReplError, match="drives"):
+        await designs.load_design(_Says('released={"released": [], "inputs": []}\r\nenabled\r\n'), "x", D, None,
+                                  ui_in=1, ui_in_mask=1)  # fmt: skip
+    with pytest.raises(ReplError, match="made inputs"):
+        await designs.load_design(_Says('released={"released": [], "inputs": [8]}\r\nenabled\r\n'), "x", D, None)
 
 
 def _pins(fake_repl) -> list[tuple[int, object]]:
@@ -761,7 +767,8 @@ async def test_a_released_pin_the_chip_no_longer_drives_is_not_made_an_output(ru
 
 async def test_release_exception_keeps_enabled_name(runner, fake_repl, uploads):
     await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
-    fake_repl._globals["_fo_ui_driven"] = [9]  # no ui_in9: the release raises
+    fake_repl._globals["_fo_ui_driven"] = [0]
+    fake_repl.tt.pins.ui_in0 = object()  # a pin with no gpio_num: the release raises
     with pytest.raises(ReplError):
         await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
     assert (await designs.list_designs(runner, DEMOS, uploads))["enabled"] == "tt_um_demo_a"
@@ -781,3 +788,12 @@ async def test_a_failed_load_drives_nothing(runner, fake_repl, uploads, monkeypa
     with pytest.raises(ReplError):
         await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads, ui_in=1, ui_in_mask=1)
     assert fake_repl.tt.made_outputs[outputs:] == [] and fake_repl._globals["_fo_ui_driven"] == []
+
+
+async def test_a_damaged_driven_list_does_not_wedge_later_loads(runner, fake_repl, uploads):
+    """Only ints 0..7 of a board-side _fo_ui_driven are released; the rest is dropped, and the list is cleared."""
+    fake_repl._globals["_fo_ui_driven"] = [9, "x", -1, None, 0]
+    out = await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    assert out["released"] == [0] and fake_repl._globals["_fo_ui_driven"] == []
+    out = await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
+    assert out["released"] == [] and (await designs.list_designs(runner, DEMOS, uploads))["enabled"] == "tt_um_demo_b"

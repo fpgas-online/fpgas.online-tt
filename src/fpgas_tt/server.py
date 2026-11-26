@@ -238,6 +238,8 @@ async def designs_enable(request: web.Request) -> web.Response:
         if ui_in is not None:
             if not _byte(ui_in):
                 return _json_error(400, "ui_in must be an integer between 0 and 255")
+            if ui_in_mask == 0:  # Ruling AO: one way to say "drive nothing"
+                return _json_error(400, "ui_in must be null when ui_in_mask is 0")
             if ui_in & ~ui_in_mask:
                 return _json_error(400, "ui_in has bits outside ui_in_mask")
         elif ui_in_mask:

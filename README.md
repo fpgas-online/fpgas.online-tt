@@ -126,14 +126,28 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   the SDK's "MCU controls inputs" mode; it sets the `ui_in` pins directly.
   The enable body's `ui_in_mask` (0 to 255, default 0) names the bits to
   drive and `ui_in` (0 to 255, or null) their values: `ui_in` may have no
-  bit outside the mask, and a mask other than 0 needs a `ui_in`. The caller
+  bit outside the mask, a mask other than 0 needs a `ui_in`, and a mask of 0
+  needs `ui_in` null. The caller
   always supplies them (the site reads a library entry's from its index); the
   daemon never fills them in.
 
-  | Step | When | What |
-  |------|------|------|
-  | Release | every load, after the buffer's hash check and before the FPGA is touched | each bit the daemon drove for the previous load (the board-side list `_fo_ui_driven`) that `GPIO_OE` (`rpregs.GPIO_OE_EXPR`) shows the chip driving is set low for 1 ms (RP2350-E9), then made `Pin.IN` with `Pin.PULL_DOWN`; on a library load every bit outside its mask that the daemon did not drive goes straight to `Pin.IN` with `Pin.PULL_DOWN`, never an output |
-  | Drive | after the load and its clock, only when the load succeeded, only when `ui_in` is given and the mask is not 0 | each mask bit is made an input with the pull-down; one that still reads high is left so (`ui_in_held`); the others get their latch set to their `ui_in` bit and only then become outputs (`ui_in_driven`, the new `_fo_ui_driven`) |
+  | Pins | Condition | Steps |
+  |------|-----------|-------|
+  | each bit in `_fo_ui_driven` | `GPIO_OE` shows it driven | latch 0; output for 1 ms; `Pin.IN`; `Pin.PULL_DOWN` |
+  | each bit in `_fo_ui_driven` | `GPIO_OE` shows it not driven | `Pin.IN`; `Pin.PULL_DOWN` |
+  | each bit outside the mask, not in `_fo_ui_driven` | library load | `Pin.IN`; `Pin.PULL_DOWN` |
+  | each mask bit | reads high with the pull-down | `Pin.IN`; `Pin.PULL_DOWN`; listed in `ui_in_held` |
+  | each mask bit | reads low with the pull-down | `Pin.IN`; `Pin.PULL_DOWN`; latch to its `ui_in` bit; `Pin.OUT`; listed in `ui_in_driven` |
+
+  The first three rows are the release. It runs on every load, after the
+  buffer's hash check and before the FPGA is touched. The 1 ms low discharges
+  the pad (RP2350-E9). `GPIO_OE`'s address comes from `rpregs.GPIO_OE_EXPR`.
+  A pin released by the other two rows is never made an output. The last two
+  rows are the drive. It runs after the load and its clock, only when the load
+  succeeded, and only when `ui_in` is given with a mask other than 0. The
+  bits it drives become the new `_fo_ui_driven`. On the board, only ints 0 to
+  7 of that list are read, so a damaged list cannot stop later loads. A soft
+  reset of the board clears the list.
 
   | Answer key | Lists |
   |------------|-------|

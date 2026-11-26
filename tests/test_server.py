@@ -756,6 +756,8 @@ async def test_bitstream_upload_unchanged_after_part_reader_move(fpga_client, fa
         ({"ui_in": 256, "ui_in_mask": 255}, 400, "ui_in must be an integer between 0 and 255"),
         ({"ui_in": 3, "ui_in_mask": 1}, 400, "ui_in has bits outside ui_in_mask"),
         ({"ui_in": None, "ui_in_mask": 1}, 400, "ui_in_mask needs a ui_in"),
+        ({"ui_in": 0}, 400, "ui_in must be null when ui_in_mask is 0"),
+        ({"ui_in": 1, "ui_in_mask": 0}, 400, "ui_in must be null when ui_in_mask is 0"),
         ({"ui_in_mask": -1}, 400, "ui_in_mask must be an integer between 0 and 255"),
         ({"ui_in_mask": True}, 400, "ui_in_mask must be an integer between 0 and 255"),
         ({"ui_in_mask": 256}, 400, "ui_in_mask must be an integer between 0 and 255"),
