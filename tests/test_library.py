@@ -88,6 +88,36 @@ def test_new_build_replaces_old_bytes(lib):
     assert files(lib) == [f"{id}.bin", f"{id}.json"]
 
 
+def test_a_replacement_cut_short_never_leaves_the_old_record_on_the_new_bytes(lib, monkeypatch):
+    id, sha, data = ENTRIES[0]
+    library.store(lib, id, sha, data, 1 << 20)
+    new = data[:8] + b"\x42" + data[9:]
+    real = library._write
+
+    def cut_short_at_the_record(path, payload):
+        if path.suffix == ".json":
+            raise OSError(28, "No space left on device")
+        real(path, payload)
+
+    monkeypatch.setattr(library, "_write", cut_short_at_the_record)
+    with pytest.raises(OSError, match="No space"):
+        library.store(lib, id, hashlib.sha256(new).hexdigest(), new, 1 << 20)
+    assert library.bin_path(lib, id).read_bytes() == new  # the new bytes landed ...
+    assert library.entries(lib) == []  # ... and no record describes them as the old build
+    monkeypatch.setattr(library, "_write", real)
+    library.store(lib, *ENTRIES[1], 1 << 20)  # the next store removes the lone .bin
+    assert files(lib) == [f"{ENTRIES[1][0]}.bin", f"{ENTRIES[1][0]}.json"]
+
+
+def test_same_sha_with_a_bin_of_the_wrong_size_is_written_again(lib):
+    id, sha, data = ENTRIES[0]
+    library.store(lib, id, sha, data, 1 << 20)
+    library.bin_path(lib, id).write_bytes(data[:100])  # not what its record says
+    assert library.store(lib, id, sha, data, 1 << 20) == (True, [])
+    assert library.bin_path(lib, id).read_bytes() == data
+    assert [(e["bin_sha256"], e["bin_bytes"]) for e in library.entries(lib)] == [(sha, 4096)]
+
+
 def test_lru_evicts_oldest_until_it_fits(lib):
     for i, (id, sha, data) in enumerate(ENTRIES[:3]):
         assert library.store(lib, id, sha, data, 3 * 4096) == (True, [])

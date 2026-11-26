@@ -153,6 +153,13 @@ def touch(library_dir: Path, id: str) -> None:
             pass
 
 
+def _bin_size(library_dir: Path, id: str) -> int | None:
+    try:
+        return bin_path(library_dir, id).stat().st_size
+    except FileNotFoundError:
+        return None
+
+
 def _write(path: Path, data: bytes) -> None:
     """Put `data` at `path` whole or not at all: a temporary file beside it, then a rename."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
@@ -200,11 +207,14 @@ def store(library_dir: Path, id: str, sha256: str, data: bytes, max_bytes: int) 
         library_dir.mkdir(parents=True, exist_ok=True)
         _remove_orphans(library_dir)
         old = _read_meta(library_dir, id)
-        if old is not None and old["bin_sha256"] == sha256:
+        if old is not None and old["bin_sha256"] == sha256 and _bin_size(library_dir, id) == old["bin_bytes"]:
             os.utime(_json_path(library_dir, id))
             return False, []
         meta = {"id": id, "bin_sha256": sha256, "bin_bytes": len(data)}
-        # the .bin first: a store cut short between the two leaves a .bin alone, which is never listed
+        # The old record goes first, so it never describes the new bytes: a replacement cut short after this
+        # leaves a .bin alone, which is never listed and which the next store removes.
+        _json_path(library_dir, id).unlink(missing_ok=True)
+        # then the .bin, then the new record: a store cut short between the two leaves a .bin alone too
         _write(bin_path(library_dir, id), data)
         _write(_json_path(library_dir, id), json.dumps(meta).encode("utf-8"))
         kept = entries(library_dir)
