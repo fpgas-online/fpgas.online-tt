@@ -177,7 +177,8 @@ def design_names(demos_dir: Path, uploads_dir: Path, *, library_dir: Path | None
     """Every design this Pi can load: a demo whose bitstream is here, every library entry kept here, and
     every upload."""
     lib = library.names(library_dir) if library_dir is not None else set()
-    # the same rule as design_file: a name is hidden only by a demo that is really here, or an entry that is
+    # the same rule as design_file: a name is hidden only by a demo that is really here, or by a library entry
+    # that is really here; each name is listed once, as the source a load would read
     return sorted(_demos_here(demos_dir) | lib | set(_upload_names(uploads_dir)))
 
 
@@ -324,12 +325,13 @@ def _load_steps(name: str, data: bytes, clock_hz: int | None) -> list[str]:
     return steps
 
 
-def _listing(demos_dir: Path, uploads_dir: Path, library_dir: Path | None) -> list[dict]:
+def _listing(demos_dir: Path, uploads_dir: Path, library_dir: Path | None) -> tuple[list[dict], int]:
+    """The listed designs, and the library's used bytes from the same read of it."""
     demos = load_demo_index(demos_dir)
-    # the library is read once, for its names and sizes; its .bin files are never hashed here
+    # the library is read once, for its names, sizes and total; its .bin files are never hashed here
     sizes = {e["id"]: e["bin_bytes"] for e in library.entries(library_dir)} if library_dir is not None else {}
     names = _demos_here(demos_dir) | set(sizes) | set(_upload_names(uploads_dir))
-    return [_meta(n, demos, sizes) for n in sorted(names)]
+    return [_meta(n, demos, sizes) for n in sorted(names)], sum(sizes.values())
 
 
 def _read_design(demos_dir: Path, uploads_dir: Path, name: str, library_dir: Path | None = None) -> bytes:
@@ -360,11 +362,14 @@ async def list_designs(
     runner: ReplRunner, demos_dir: Path, uploads_dir: Path, *, library_dir: Path | None = None
 ) -> dict:
     """What the board has loaded, and the designs on this Pi. `enabled` is what the board's SDK says, so it
-    can name a library entry that has since been evicted."""
+    can name a library entry that has since been evicted. With `library_dir`, `library.used_bytes` is the
+    total of the entries listed, from the same read."""
     out = _parse_json(await runner.exec(ENABLED_CODE))
     # The Pi's root is on NFS: its files are read off the event loop, which also serves the serial bridge.
-    listing = await asyncio.to_thread(_listing, demos_dir, uploads_dir, library_dir)
-    return {"enabled": out["enabled"], "designs": listing}
+    listing, used = await asyncio.to_thread(_listing, demos_dir, uploads_dir, library_dir)
+    if library_dir is None:
+        return {"enabled": out["enabled"], "designs": listing}
+    return {"enabled": out["enabled"], "library": {"used_bytes": used}, "designs": listing}
 
 
 async def enable_design(

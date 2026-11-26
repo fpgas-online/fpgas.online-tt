@@ -535,6 +535,8 @@ PUSH_CHECKS = {
     "file_too_large": dict(file=ICE40_PREAMBLE + b"\x01" * (256 * 1024), status=400, error="bitstream too large"),
     "meta_too_long": dict(meta="x" * 4097, status=400, error="meta too long"),
     "meta_not_json": dict(meta="{not json", status=400, error="meta: not JSON"),
+    # RecursionError on Python 3.11 ("not JSON"); a 3.14 parser reads it as a list ("must be a JSON object")
+    "meta_nested_too_deep": dict(meta="[" * 2000 + "]" * 2000, status=400, error="meta: "),
     "meta_nan": dict(meta=json.dumps(LIB_META)[:-1].replace("4096", "NaN") + "}", status=400, error="meta: not JSON"),
     "meta_not_an_object": dict(meta="[1, 2]", status=400, error="meta: must be a JSON object"),
     "meta_extra_key": dict(meta={**LIB_META, "title": ""}, status=400, error="meta: keys must be exactly"),

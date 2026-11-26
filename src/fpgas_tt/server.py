@@ -189,8 +189,9 @@ async def designs_list(request: web.Request) -> web.Response:
         app = request.app
         body = await designs.list_designs(app["repl"], app["demos_dir"], app["uploads_dir"],
                                           library_dir=app["library_dir"])  # fmt: skip
-        used = await asyncio.to_thread(library.used_bytes, app["library_dir"])
-        # `library` says this daemon has the VGA library; an older one does not send it
+        # `library` says this daemon has the VGA library; an older one does not send it. used_bytes is from the
+        # same read of the library as the listing, so the two always agree.
+        used = body["library"]["used_bytes"]
         return web.json_response({"enabled": body["enabled"],
                                   "library": {"max_bytes": app["library_max_bytes"], "used_bytes": used},
                                   "designs": body["designs"]})  # fmt: skip
@@ -335,7 +336,7 @@ async def library_push(request: web.Request) -> web.Response:
         return _json_error(400, LIBRARY_PARTS)
     try:
         meta = json.loads(parts["meta"].decode("utf-8"), parse_constant=_no_constant)  # no NaN, no Infinity
-    except ValueError:  # UnicodeDecodeError is a ValueError
+    except (ValueError, RecursionError):  # UnicodeDecodeError is a ValueError; deep nesting is a RecursionError
         return _json_error(400, "meta: not JSON")
     if (why := library.check_meta(meta)) is not None:
         return _json_error(400, f"meta: {why}")
