@@ -1,11 +1,13 @@
 """FPGA-board designs: list them, load one into the FPGA, keep a visitor's upload.
 
 Nothing here writes to the demo board's filesystem (Tim, 2026-10-05: nothing at all may write to the Tiny
-Tapeout boards). Every design is a file on the Pi: the demos in the package's demos directory, and uploads in
-the daemon's own uploads directory. Loading one sends its bytes over the REPL into a buffer in the RP2350's
-memory and has the SDK's own loader clock that buffer into the iCE40, so the board's state afterwards is what
-the SDK's ``tt.shuttle.<design>.enable()`` leaves (``tt.shuttle.enabled`` names the design), and no file is
-involved. The files an older daemon copied to the board's /bitstreams are left alone: not read, not removed.
+Tapeout boards). Every design is a file on the Pi: the demos in the package's demos directory, the VGA
+library's entries the site pushed (library.py), and uploads in the daemon's own uploads directory. A name is a
+demo first, then a library entry, then an upload. Loading one sends its bytes over the REPL into a buffer in
+the RP2350's memory and has the SDK's own loader clock that buffer into the iCE40, so the board's state
+afterwards is what the SDK's ``tt.shuttle.<design>.enable()`` leaves (``tt.shuttle.enabled`` names the
+design), and no file is involved. The files an older daemon copied to the board's /bitstreams are left
+alone: not read, not removed.
 
 Board-side facts (TT SDK 3.1.0, FPGA breakout): ``tt.shuttle.enable(design)`` resets the pins, records
 ``tt.shuttle.enabled`` and calls ``ttboard.fpga.fabricfoxv2.spi_transferPIO(design.file)``, which opens that
@@ -29,6 +31,7 @@ import threading
 import time
 from pathlib import Path
 
+from fpgas_tt import library
 from fpgas_tt.repl import ReplBusy, ReplError, ReplRunner
 
 log = logging.getLogger(__name__)
@@ -97,23 +100,40 @@ def load_demo_index(demos_dir: Path) -> dict[str, dict]:
     return out
 
 
-def _meta(name: str, demos: dict[str, dict]) -> dict:
+def _meta(name: str, demos: dict[str, dict], library_sizes: dict[str, int]) -> dict:
+    """A listed design. `name` is a demo when the demo is really here (design_names), else a library entry,
+    else an upload. A library entry has an upload's "unknown" placeholders, plus its size: its real metadata
+    is in the site's copy of the library index, never here."""
     d = demos.get(name)
-    if d is None:
-        return {"name": name, "title": "", "author": "", "description": "", "docs_url": "", "repo_url": "",
-                "clock_hz": None, "pinout": {}, "source": "upload"}
-    return {"name": name, **{k: d.get(k, "") for k in META_FIELDS}, "clock_hz": d.get("clock_hz"),
-            "pinout": d.get("pinout") or {}, "source": "demo"}
+    if d is not None:
+        return {"name": name, **{k: d.get(k, "") for k in META_FIELDS}, "clock_hz": d.get("clock_hz"),
+                "pinout": d.get("pinout") or {}, "source": "demo"}
+    unknown = {"name": name, "title": "", "author": "", "description": "", "docs_url": "", "repo_url": "",
+               "clock_hz": None, "pinout": {}}
+    if name in library_sizes:
+        return {**unknown, "source": "library", "size": library_sizes[name]}
+    return {**unknown, "source": "upload"}
 
 
 # -- validation --
-def validate_bitstream(name: str, data: bytes, demo_names: set[str]) -> None:
-    if not NAME_RE.match(name or ""):
-        raise ValidationError("name must match ^[a-z0-9_]{1,40}$")
+def check_name_free(name: str, demo_names: set[str]) -> None:
+    """Refuse a name no upload or library entry may take: a demo's, or the idle display's."""
     if name in demo_names:
         raise ValidationError(f"{name} is a demo name; pick another", 409)
     if name == IDLE_NAME:
         raise ValidationError(f"{name} is the daemon's own name for its idle display; pick another", 409)
+
+
+def validate_bitstream(
+    name: str, data: bytes, demo_names: set[str], library_names: set[str] | frozenset[str] = frozenset()
+) -> None:
+    """Refuse a bitstream the Pi must not keep under `name`. `library_names` are the library entries kept
+    here: an upload may not take one (a library push may, since it is the entry itself)."""
+    if not NAME_RE.match(name or ""):
+        raise ValidationError("name must match ^[a-z0-9_]{1,40}$")
+    check_name_free(name, demo_names)
+    if name in library_names:
+        raise ValidationError(f"{name} is a VGA library design; pick another", 409)
     if len(data) > MAX_BITSTREAM_BYTES:
         raise ValidationError(f"bitstream too large ({len(data)} bytes, limit {MAX_BITSTREAM_BYTES})")
     if ICE40_PREAMBLE not in data[:PREAMBLE_WINDOW + len(ICE40_PREAMBLE)]:
@@ -140,24 +160,38 @@ def _upload_names(uploads_dir: Path) -> list[str]:
     return sorted(f[:-4] for f in files if f.endswith(".bin") and NAME_RE.match(f[:-4]))
 
 
-def design_names(demos_dir: Path, uploads_dir: Path) -> list[str]:
-    """Every design this Pi can load: a demo whose bitstream is here, and every upload."""
+def has_upload(uploads_dir: Path, name: str) -> bool:
+    return NAME_RE.match(name or "") is not None and _upload_file(uploads_dir, name).is_file()
+
+
+def _demos_here(demos_dir: Path) -> set[str]:
     demos = load_demo_index(demos_dir)
     here = {n for n in demos if _demo_file(demos_dir, n).is_file()}
     missing = sorted(set(demos) - here)
     if missing:
         log.warning("demos: listed in index.json but the bitstream is missing: %s", ", ".join(missing))
-    # the same rule as design_file: an upload is hidden only by a demo that is really here
-    return sorted(here | set(_upload_names(uploads_dir)))
+    return here
 
 
-def design_file(demos_dir: Path, uploads_dir: Path, name: str) -> Path:
-    """The file of design `name` on this Pi. A demo wins over an upload of the same name (uploads are refused
-    a demo's name, so that is only a file put there by hand)."""
+def design_names(demos_dir: Path, uploads_dir: Path, *, library_dir: Path | None = None) -> list[str]:
+    """Every design this Pi can load: a demo whose bitstream is here, every library entry kept here, and
+    every upload."""
+    lib = library.names(library_dir) if library_dir is not None else set()
+    # the same rule as design_file: a name is hidden only by a demo that is really here, or by a library entry
+    # that is really here; each name is listed once, as the source a load would read
+    return sorted(_demos_here(demos_dir) | lib | set(_upload_names(uploads_dir)))
+
+
+def design_file(demos_dir: Path, uploads_dir: Path, name: str, *, library_dir: Path | None = None) -> Path:
+    """The file of design `name` on this Pi: a demo first, then a library entry, then an upload. Uploads are
+    refused a demo's name and a cached library id, and a push is refused a demo's name, so a name taken twice
+    is a file put there by hand, or an upload made before the library entry was pushed."""
     if not NAME_RE.match(name or ""):
         raise DesignNotFound(name)
     if name in load_demo_index(demos_dir) and _demo_file(demos_dir, name).is_file():
         return _demo_file(demos_dir, name)
+    if library_dir is not None and name in library.names(library_dir):
+        return library.bin_path(library_dir, name)
     if _upload_file(uploads_dir, name).is_file():
         return _upload_file(uploads_dir, name)
     raise DesignNotFound(name)
@@ -291,16 +325,25 @@ def _load_steps(name: str, data: bytes, clock_hz: int | None) -> list[str]:
     return steps
 
 
-def _listing(demos_dir: Path, uploads_dir: Path) -> list[dict]:
+def _listing(demos_dir: Path, uploads_dir: Path, library_dir: Path | None) -> tuple[list[dict], int]:
+    """The listed designs, and the library's used bytes from the same read of it."""
     demos = load_demo_index(demos_dir)
-    return [_meta(n, demos) for n in design_names(demos_dir, uploads_dir)]
+    # the library is read once, for its names, sizes and total; its .bin files are never hashed here
+    sizes = {e["id"]: e["bin_bytes"] for e in library.entries(library_dir)} if library_dir is not None else {}
+    names = _demos_here(demos_dir) | set(sizes) | set(_upload_names(uploads_dir))
+    return [_meta(n, demos, sizes) for n in sorted(names)], sum(sizes.values())
 
 
-def _read_design(demos_dir: Path, uploads_dir: Path, name: str) -> bytes:
+def _read_design(demos_dir: Path, uploads_dir: Path, name: str, library_dir: Path | None = None) -> bytes:
+    """The bytes of design `name`. Reading a library entry counts as using it: its LRU time is refreshed."""
+    path = design_file(demos_dir, uploads_dir, name, library_dir=library_dir)
     try:
-        return design_file(demos_dir, uploads_dir, name).read_bytes()
-    except FileNotFoundError as exc:  # an upload removed to make room, between finding it and reading it
+        data = path.read_bytes()
+    except FileNotFoundError as exc:  # removed to make room, between finding it and reading it
         raise DesignNotFound(name) from exc
+    if library_dir is not None and path == library.bin_path(library_dir, name):
+        library.touch(library_dir, name)
+    return data
 
 
 async def ensure_sdk(runner: ReplRunner) -> None:
@@ -315,19 +358,34 @@ async def ensure_sdk(runner: ReplRunner) -> None:
         raise ReplError("the board's main.py did not start the Tiny Tapeout SDK", said)
 
 
-async def list_designs(runner: ReplRunner, demos_dir: Path, uploads_dir: Path) -> dict:
+async def list_designs(
+    runner: ReplRunner, demos_dir: Path, uploads_dir: Path, *, library_dir: Path | None = None
+) -> dict:
+    """What the board has loaded, and the designs on this Pi. `enabled` is what the board's SDK says, so it
+    can name a library entry that has since been evicted. With `library_dir`, `library.used_bytes` is the
+    total of the entries listed, from the same read."""
     out = _parse_json(await runner.exec(ENABLED_CODE))
     # The Pi's root is on NFS: its files are read off the event loop, which also serves the serial bridge.
-    return {"enabled": out["enabled"], "designs": await asyncio.to_thread(_listing, demos_dir, uploads_dir)}
+    listing, used = await asyncio.to_thread(_listing, demos_dir, uploads_dir, library_dir)
+    if library_dir is None:
+        return {"enabled": out["enabled"], "designs": listing}
+    return {"enabled": out["enabled"], "library": {"used_bytes": used}, "designs": listing}
 
 
 async def enable_design(
-    runner: ReplRunner, name: str, clock_hz: int | None, demos_dir: Path, uploads_dir: Path, *, waited: float = 0.0
+    runner: ReplRunner,
+    name: str,
+    clock_hz: int | None,
+    demos_dir: Path,
+    uploads_dir: Path,
+    *,
+    library_dir: Path | None = None,
+    waited: float = 0.0,
 ) -> dict:
     """Load design `name`. `waited` is what the caller already spent waiting for the board: it comes out of
     the deadline, which is the caller's whole request's, the start of the SDK included."""
     # design_file refuses a name the Pi could never have before anything goes near the board.
-    data = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name)
+    data = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name, library_dir)
     started = time.monotonic() - waited
     if ENABLE_OVERALL_TIMEOUT - waited < ENABLE_LEAST:
         raise ReplBusy("the board was busy for too long; try again")

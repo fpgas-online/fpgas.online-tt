@@ -51,10 +51,12 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   unit file in fpgas.online-test-designs, so the report is there first). The daemon never asks the
   board what it is: the boot check does that, and a second prober would get in
   a visitor's way. The serial bridge works whatever the kind.
-- On `kind: fpga` boards, three extra routes list, load and accept designs.
+- On `kind: fpga` boards, five extra routes list, load and accept designs.
   **Nothing writes to the demo board's filesystem.** Every design is a file on
-  the Pi: the packaged demos (`--demos-dir`) and visitors' uploads
-  (`--uploads-dir`). Loading one sends its bytes over the board's raw
+  the Pi: the packaged demos (`--demos-dir`), the VGA library's entries the
+  site pushed (`--library-dir`, below) and visitors' uploads
+  (`--uploads-dir`). A name is a demo first, then a library entry, then an
+  upload. Loading one sends its bytes over the board's raw
   MicroPython REPL into a buffer in the RP2350's memory and has the SDK's own
   loader clock that buffer into the iCE40, so the board ends in the state the
   SDK's `tt.shuttle.<design>.enable()` leaves, with no file involved. The REPL
@@ -63,17 +65,19 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
 
   | Route | Description |
   |-------|-------------|
-  | `GET /designs` | `{"enabled": str\|null, "designs": [{"name", "title", "author", "description", "docs_url", "repo_url", "clock_hz", "pinout", "source": "demo"\|"upload"}, ...]}` — every demo whose `.bin` is on the Pi, with its metadata from `index.json`, and every upload; `enabled` is what the board's SDK says is loaded (`null` when the SDK is not running) |
-  | `POST /designs/{name}/enable` | body `{"clock_hz": int}` (optional) → `{"enabled": name, "clock_hz": int\|null}`; if the board's SDK is not running, does what the Commander does in that case (a soft reset from the friendly REPL: Ctrl-C twice, Ctrl-B, Ctrl-D, which runs the board's own `main.py`), then sends the bitstream and loads it; bounded to a 25 s overall REPL deadline (below the site proxy's own 30 s/45 s read timeouts, so a stuck load still gets a clean 502 from this daemon instead of the client seeing a raw connection reset) |
-  | `POST /bitstream` | multipart form (`name`, `file`) → `201 {"name", "size", "evicted": [str, ...]}`; kept on the Pi, the board is not involved; rejects names that collide with a demo, non-`[a-z0-9_]{1,40}` names, oversize (>256 KiB) or non-iCE40 files (400); removes the oldest uploads first so at most 16 remain |
+  | `GET /designs` | `{"enabled": str\|null, "library": {"max_bytes", "used_bytes"}, "designs": [{"name", "title", "author", "description", "docs_url", "repo_url", "clock_hz", "pinout", "source": "demo"\|"library"\|"upload"}, ...]}` — every demo whose `.bin` is on the Pi, with its metadata from `index.json`, every library entry kept here and every upload; a library entry has an upload's placeholders (`""`, `clock_hz` null, `pinout` `{}`) plus `size`, since its metadata is in the site's index; `enabled` is what the board's SDK says is loaded (`null` when the SDK is not running) |
+  | `POST /designs/{name}/enable` | body `{"clock_hz": int}` (optional) → `{"enabled": name, "clock_hz": int\|null}`; if the board's SDK is not running, does what the Commander does in that case (a soft reset from the friendly REPL: Ctrl-C twice, Ctrl-B, Ctrl-D, which runs the board's own `main.py`), then sends the bitstream and loads it; bounded to a 25 s overall REPL deadline (below the site proxy's own 30 s/45 s read timeouts, so a stuck load still gets a clean 502 from this daemon instead of the client seeing a raw connection reset); loading a library entry refreshes its LRU time |
+  | `POST /bitstream` | multipart form (`name`, `file`) → `201 {"name", "size", "evicted": [str, ...]}`; kept on the Pi, the board is not involved; rejects names that collide with a demo or a cached library entry (409), non-`[a-z0-9_]{1,40}` names, oversize (>256 KiB) or non-iCE40 files (400); removes the oldest uploads first so at most 16 remain |
+  | `GET /library` | `{"max_bytes", "used_bytes", "entries": [{"id", "bin_sha256", "bin_bytes", "used_at"}, ...]}`; never asks the board |
+  | `POST /library/{id}` | multipart form (`meta`: `{"id", "bin_sha256", "bin_bytes"}`, at most 4 KiB; `file`, at most 256 KiB) → `201`, or `200` when the same `bin_sha256` is already kept, `{"id", "bin_bytes", "bin_sha256", "evicted": [str, ...], "hides_upload": bool}`; checks the meta's keys and types, that `meta.id` is `{id}`, that `{id}` is not a demo's or `idle_display` (409), and the file's size, SHA-256, size cap and preamble (400); the board is not involved |
 
   A board that told the check it carries a chip gets `404 {"error": "not an
-  fpga board", "detail": why}` on all three, and one the report does not say
+  fpga board", "detail": why}` on all five, and one the report does not say
   that for yet gets `503 {"error": "board not identified yet", "detail":
   why}`.
   Other error shapes (`{"error": str, "detail": str}`): `503 board
-  not present`, `409 another task is running` (or a demo-name collision on
-  upload), `404 no such design` (including a name that could never be
+  not present`, `409 another task is running` (or a name taken by a demo,
+  the idle display or a library entry), `404 no such design` (including a name that could never be
   valid — rejected before the board is asked), `502 REPL task failed`
   (detail is the board's traceback, ANSI/non-printable bytes stripped and
   truncated), `400` for validation failures, `500 internal error` for
@@ -84,6 +88,39 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   `/var/lib/fpgas-tt/uploads`, the service's `StateDirectory`) keeps uploads;
   on the fleet's Pis that is lost at a reboot, like everything else a visitor
   leaves on a Pi.
+- **The VGA library** (`library.py`) is a cache of prebuilt bitstreams of Tiny
+  Tapeout VGA designs, pushed by the
+  [site](https://github.com/fpgas-online/fpgas.online-site) with
+  `POST /library/{id}` before it asks for a load. The Pi fetches nothing; the
+  site gets the index and the bitstreams from the archive and checks them.
+  `--library-dir` (default `/var/lib/fpgas-tt/library`, in the same
+  `StateDirectory`) holds `<id>.bin` and `<id>.json`
+  (`{"id", "bin_sha256", "bin_bytes"}` and nothing else); all other metadata
+  is in the site's index. The `.bin` files are capped in total by
+  `--library-max-bytes`, whose default is the environment variable
+  `FPGAS_TT_LIBRARY_MAX_BYTES`, else 16777216 (16 MiB, about 160 designs);
+  infra sets it with a systemd drop-in. A push evicts the least recently used
+  entries, by the mtime of their `.json` (a push or a load refreshes it),
+  until the total fits. A new build first removes the old `.json`; then
+  writes go `.bin` first, then `.json`, each through a
+  temporary file and a rename, under one lock; each push first removes what a
+  push cut short left (a `.bin` or `.json` alone, `.*.tmp` files), which is
+  never listed or counted. The cache never touches the uploads, the demos or
+  the idle design, and is lost at a reboot like the uploads; the site pushes
+  again.
+
+  Concurrency: two pushes are put in order by the library lock. A push and an
+  upload use separate locks and directories, so neither evicts the other's
+  files. An upload's check that its name is not a cached library id and a
+  push of that same id are not under one lock: if they cross, both files are
+  kept and the library entry wins at load time, as for an upload made before
+  the site had the index; the push's `hides_upload` says so only when the
+  upload was kept before the push answered. A push during a load only writes files; the load has
+  already read its bytes, though an enable that arrives during a
+  replacement, between the old record's removal and the new record (a
+  window of microseconds), gets 404 or loads a hidden upload of the same
+  name. An entry evicted between a push and an enable
+  makes the enable answer 404, and the site may push again.
 - **The display of an FPGA board nobody is using is kept moving**
   (`idle.py`). The boot check ends by streaming a design that animates the
   display from the FPGA's own oscillator, but every start of the board's SDK
