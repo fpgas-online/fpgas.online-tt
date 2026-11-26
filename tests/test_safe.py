@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from fpgas_tt import idle, rpregs, safe
+from fpgas_tt import designs, idle, rpregs, safe
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.repl import ReplBusy, ReplError
 from fpgas_tt.server import create_app
@@ -327,3 +327,11 @@ def test_an_rp2350_reply_whose_driven_pins_are_the_ones_made_outputs_is_set():
         "ui_in_was": 1, "uio_oe_was": 0x0F,
     }  # fmt: skip
     assert safe.outcome(reply).startswith("set: ")
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_safe_code_byte_identical(retry):
+    """SAFE_CODE builds its contention guard with designs.ui_in_guard; the text sent to the board is what it was."""
+    snapshot = Path(__file__).parent / "data" / f"safe_code_retry_{str(retry).lower()}.txt"
+    assert safe.safe_code(retry) == snapshot.read_text()
+    assert designs.ui_in_guard(12, "_fo_r['held']") in safe.safe_code(retry)

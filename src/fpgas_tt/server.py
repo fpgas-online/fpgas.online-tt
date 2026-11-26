@@ -200,6 +200,11 @@ async def designs_list(request: web.Request) -> web.Response:
     return await _run(request, go())
 
 
+def _byte(value) -> bool:
+    """An int from 0 to 255; never a bool."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 255
+
+
 async def designs_enable(request: web.Request) -> web.Response:
     if (err := _fpga_only(request)) is not None:
         return err
@@ -207,13 +212,16 @@ async def designs_enable(request: web.Request) -> web.Response:
         # Not a name the board could ever have -- don't even ask it (and
         # don't let an unvalidated path segment anywhere near board code).
         return _json_error(404, "no such design")
-    clock_hz = None
+    clock_hz = ui_in = None
+    ui_in_mask = 0
     if request.can_read_body:
         try:
             body = await request.json()
         except ValueError:
             return _json_error(400, "body must be JSON")
-        clock_hz = body.get("clock_hz") if isinstance(body, dict) else None
+        if not isinstance(body, dict):
+            body = {}
+        clock_hz = body.get("clock_hz")
         if clock_hz is not None:
             # bool is a subclass of int in Python -- {"clock_hz": true} must
             # not silently become clock_hz=1.
@@ -221,13 +229,26 @@ async def designs_enable(request: web.Request) -> web.Response:
                 return _json_error(400, "clock_hz must be an integer")
             if not (CLOCK_HZ_MIN <= clock_hz <= CLOCK_HZ_MAX):
                 return _json_error(400, f"clock_hz must be between {CLOCK_HZ_MIN} and {CLOCK_HZ_MAX}")
+        # The caller always supplies ui_in and ui_in_mask (the site, from its library index); the daemon never
+        # fills them in. Only the mask's bits are driven, and a mask of 0 drives nothing.
+        ui_in_mask = body.get("ui_in_mask", 0)
+        if not _byte(ui_in_mask):
+            return _json_error(400, "ui_in_mask must be an integer between 0 and 255")
+        ui_in = body.get("ui_in")
+        if ui_in is not None:
+            if not _byte(ui_in):
+                return _json_error(400, "ui_in must be an integer between 0 and 255")
+            if ui_in & ~ui_in_mask:
+                return _json_error(400, "ui_in has bits outside ui_in_mask")
+        elif ui_in_mask:
+            return _json_error(400, "ui_in_mask needs a ui_in")
 
     async def go(waited: float):
         app = request.app
         return web.json_response(
             await designs.enable_design(
                 app["repl"], request.match_info["name"], clock_hz, app["demos_dir"], app["uploads_dir"],
-                library_dir=app["library_dir"], waited=waited,
+                library_dir=app["library_dir"], ui_in=ui_in, ui_in_mask=ui_in_mask, waited=waited,
             )  # fmt: skip
         )
 

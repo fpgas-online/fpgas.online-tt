@@ -167,7 +167,7 @@ async def test_a_client_that_connects_while_the_idle_design_is_streamed_is_held_
         arrived.append(asyncio.ensure_future(c.ws_connect("/serial")))
         await wait_for(lambda: app["websockets"])  # the server has the socket, and holds it
         assert bridge.clients == 0  # not bridged to the board
-        await load(*args, **kwargs)
+        return await load(*args, **kwargs)
 
     monkeypatch.setattr(designs, "load_design", load_while_somebody_connects)
     assert await show.step() == "loaded"
@@ -195,7 +195,7 @@ async def test_a_run_that_arrives_while_the_idle_design_is_streamed_waits_and_th
         if not runs:
             runs.append(asyncio.ensure_future(c.post("/designs/tt_um_demo_a/enable")))
             await asyncio.sleep(0.05)
-        await load(*args, **kwargs)
+        return await load(*args, **kwargs)
 
     monkeypatch.setattr(designs, "load_design", load_while_somebody_runs)
     assert await show.step() == "loaded"
@@ -236,8 +236,9 @@ async def test_what_a_run_waited_for_the_board_comes_out_of_its_deadline(
 
     left: list = []
 
-    async def load(runner, name, data, clock_hz, *, overall):
+    async def load(runner, name, data, clock_hz, *, overall, **kwargs):
         left.append(overall)
+        return {"released": [], "ui_in_driven": [], "ui_in_held": [], "ui_in_inputs": []}
 
     monkeypatch.undo()
     monkeypatch.setattr(designs, "load_design", load)
@@ -508,3 +509,19 @@ def test_the_daemons_defaults_are_the_boot_checks_file_a_minute_and_no_replacing
     assert args.idle_design == str(idle.IDLE_DESIGN_DEFAULT)
     assert str(idle.IDLE_DESIGN_DEFAULT).endswith("/tt-display-tt-fpga/tt_fpga_platform.bin")
     assert args.idle_after == 60 and args.idle_replace_after is None
+
+
+async def test_idle_display_load_releases_too(bridge, fake_repl, tmp_path, design):
+    """The idle display's own load releases the ui_in pins the daemon drove for the design before it."""
+    app = an_app(bridge, tmp_path)
+    await designs.enable_design(app["repl"], "tt_um_demo_a", None, DEMOS, tmp_path / "pi-uploads",
+                                ui_in=1, ui_in_mask=1)  # fmt: skip
+    assert fake_repl._globals["_fo_ui_driven"] == [0] and fake_repl.tt.ui_pin(0).hw_mode == 1
+    show = idle.IdleDisplay(app, design=design, after=60, replace_after=60)
+    quiet_for(app, 60)
+    latches = len(fake_repl.tt.latch_writes)
+    assert await show.step() == "loaded"
+    assert fake_repl._globals["_fo_ui_driven"] == []
+    assert fake_repl.tt.latch_writes[latches:] == [(0, 0)]  # discharged, then released
+    assert (fake_repl.tt.ui_pin(0).hw_mode, fake_repl.tt.ui_pin(0).hw_pull) == (0, 2)  # Pin.IN, Pin.PULL_DOWN
+    assert b"globals().get('_fo_ui_driven')" in bytes(fake_repl.transcript)

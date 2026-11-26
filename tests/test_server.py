@@ -295,7 +295,8 @@ async def test_designs_list_enable_and_upload_flow_never_changes_a_file_on_the_b
 
     resp = await fpga_client.post("/designs/tt_um_demo_a/enable", json={"clock_hz": 100})
     assert resp.status == 200
-    assert await resp.json() == {"enabled": "tt_um_demo_a", "clock_hz": 100}
+    assert await resp.json() == {"enabled": "tt_um_demo_a", "clock_hz": 100, "ui_in": None, "ui_in_mask": 0,
+                                 "ui_in_driven": [], "ui_in_held": [], "ui_in_inputs": [], "released": []}
     assert (await fpga_client.post("/designs/nope/enable")).status == 404
     assert (await fpga_client.post("/designs/custom/enable")).status == 404  # on the board only: not a design
 
@@ -746,3 +747,31 @@ async def test_bitstream_upload_unchanged_after_part_reader_move(fpga_client, fa
     assert (await resp.json())["error"].startswith(c["error"])
     assert not (tmp_path / "pi-uploads").exists() or list((tmp_path / "pi-uploads").iterdir()) == []
     assert fake_repl.transcript == b""
+
+
+@pytest.mark.parametrize(
+    "body,status,error",
+    [
+        ({"ui_in": True}, 400, "ui_in must be an integer between 0 and 255"),
+        ({"ui_in": 256, "ui_in_mask": 255}, 400, "ui_in must be an integer between 0 and 255"),
+        ({"ui_in": 3, "ui_in_mask": 1}, 400, "ui_in has bits outside ui_in_mask"),
+        ({"ui_in": None, "ui_in_mask": 1}, 400, "ui_in_mask needs a ui_in"),
+        ({"ui_in_mask": -1}, 400, "ui_in_mask must be an integer between 0 and 255"),
+        ({"ui_in_mask": True}, 400, "ui_in_mask must be an integer between 0 and 255"),
+        ({"ui_in_mask": 256}, 400, "ui_in_mask must be an integer between 0 and 255"),
+        ({"ui_in": 1, "ui_in_mask": 1}, 200, None),
+        ({}, 200, None),
+    ],
+)
+async def test_enable_body_ui_in_rules(fpga_client, fake_repl, body, status, error):
+    resp = await fpga_client.post("/designs/tt_um_demo_a/enable", json=body)
+    assert resp.status == status, await resp.text()
+    got = await resp.json()
+    if error is not None:
+        assert got["error"] == error
+        assert fake_repl.transcript == b""  # refused before the board was asked
+        return
+    ui_in, mask = body.get("ui_in"), body.get("ui_in_mask", 0)
+    assert got == {"enabled": "tt_um_demo_a", "clock_hz": None, "ui_in": ui_in, "ui_in_mask": mask,
+                   "ui_in_driven": [0] if mask else [], "ui_in_held": [], "ui_in_inputs": [],
+                   "released": []}  # fmt: skip

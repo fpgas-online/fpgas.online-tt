@@ -90,13 +90,8 @@ SAFE_CODE = (
     "            _fo_p = getattr(_fo_tt.pins, 'ui_in%d' % _fo_i)\n"
     # Whatever the SDK believes: its pin keeps the mode it last set, and the boot check changed the pins behind
     # it (issue #196). An input with the pull-down first; driven only if it then reads low.
-    "            _fo_p.mode = Pin.IN\n"
-    "            _fo_p.pull = Pin.PULL_DOWN\n"
-    "            time.sleep_ms(5)\n"
-    "            if _fo_p():\n"
-    "                _fo_r['held'].append(_fo_i)\n"
-    "                continue\n"
-    "            _fo_p.mode = Pin.OUT\n"
+    + designs.ui_in_guard(12, "_fo_r['held']")
+    + "            _fo_p.mode = Pin.OUT\n"
     "        time.sleep_ms(5)\n"
     "        _fo_oe = machine.mem32[" + GPIO_OE_EXPR + "]\n"  # SIO GPIO_OE: which pins the chip drives
     "        _fo_r['clock'] = _fo_tt.auto_clocking_freq if _fo_tt.is_auto_clocking else 0\n"
