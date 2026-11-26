@@ -116,7 +116,10 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   kept and the library entry wins at load time, as for an upload made before
   the site had the index; the push's `hides_upload` says so only when the
   upload was kept before the push answered. A push during a load only writes files; the load has
-  already read its bytes. An entry evicted between a push and an enable
+  already read its bytes, though an enable that arrives during a
+  replacement, between the old record's removal and the new record (a
+  window of microseconds), gets 404 or loads a hidden upload of the same
+  name. An entry evicted between a push and an enable
   makes the enable answer 404, and the site may push again.
 - **The display of an FPGA board nobody is using is kept moving**
   (`idle.py`). The boot check ends by streaming a design that animates the
