@@ -101,12 +101,23 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   `FPGAS_TT_LIBRARY_MAX_BYTES`, else 16777216 (16 MiB, about 160 designs);
   infra sets it with a systemd drop-in. A push evicts the least recently used
   entries, by the mtime of their `.json` (a push or a load refreshes it),
-  until the total fits. Writes go `.bin` first, then `.json`, each through a
+  until the total fits. A new build first removes the old `.json`; then
+  writes go `.bin` first, then `.json`, each through a
   temporary file and a rename, under one lock; each push first removes what a
   push cut short left (a `.bin` or `.json` alone, `.*.tmp` files), which is
   never listed or counted. The cache never touches the uploads, the demos or
   the idle design, and is lost at a reboot like the uploads; the site pushes
   again.
+
+  Concurrency: two pushes are put in order by the library lock. A push and an
+  upload use separate locks and directories, so neither evicts the other's
+  files. An upload's check that its name is not a cached library id and a
+  push of that same id are not under one lock: if they cross, both files are
+  kept and the library entry wins at load time, as for an upload made before
+  the site had the index; the push's `hides_upload` says so only when the
+  upload was kept before the push answered. A push during a load only writes files; the load has
+  already read its bytes. An entry evicted between a push and an enable
+  makes the enable answer 404, and the site may push again.
 - **The display of an FPGA board nobody is using is kept moving**
   (`idle.py`). The boot check ends by streaming a design that animates the
   display from the FPGA's own oscillator, but every start of the board's SDK
