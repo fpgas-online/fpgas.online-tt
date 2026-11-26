@@ -1,0 +1,35 @@
+import json
+_fo_tt = globals().get('tt')
+_fo_r = {'sdk': _fo_tt is not None}
+if _fo_tt is not None:
+    _fo_en = _fo_tt.shuttle.enabled
+    _fo_r['enabled'] = _fo_en.name if _fo_en else None
+    _fo_r['mode'] = _fo_tt.mode_str
+    _fo_r['clock_was'] = _fo_tt.auto_clocking_freq if _fo_tt.is_auto_clocking else 0
+    if _fo_r['enabled'] == 'tt_um_factory_test' and _fo_r['mode'] == 'ASIC_RP_CONTROL' and (_fo_r['clock_was'] or True):
+        import time
+        from machine import Pin
+        _fo_r['ui_in_was'] = int(_fo_tt.ui_in.value)
+        _fo_r['uio_oe_was'] = int(_fo_tt.uio_oe_pico.value)
+        _fo_tt.clock_project_stop()
+        _fo_tt.uio_oe_pico.value = 0
+        _fo_tt.ui_in.value = 0
+        import machine
+        _fo_r['held'] = []
+        for _fo_i in range(8):
+            _fo_p = getattr(_fo_tt.pins, 'ui_in%d' % _fo_i)
+            _fo_p.mode = Pin.IN
+            _fo_p.pull = Pin.PULL_DOWN
+            time.sleep_ms(5)
+            if _fo_p():
+                _fo_r['held'].append(_fo_i)
+                continue
+            _fo_p.mode = Pin.OUT
+        time.sleep_ms(5)
+        _fo_oe = machine.mem32[(0xd0000030 if (machine.mem32[0x40000000] >> 12) & 0xffff == 4 else 0xd0000020)]
+        _fo_r['clock'] = _fo_tt.auto_clocking_freq if _fo_tt.is_auto_clocking else 0
+        _fo_r['ui_in'] = int(_fo_tt.ui_in.value)
+        _fo_r['uio_oe'] = int(_fo_tt.uio_oe_pico.value)
+        _fo_r['driven'] = [_fo_i for _fo_i in range(8)
+                           if _fo_oe >> getattr(_fo_tt.pins, 'ui_in%d' % _fo_i).gpio_num & 1]
+print(json.dumps(_fo_r))

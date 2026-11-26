@@ -188,6 +188,21 @@ PIN_IN, PIN_OUT, PULL_DOWN = 0, 1, 2  # machine.Pin's constants, as far as the d
 RP2040_UI_IN_GPIOS = [9, 10, 11, 12, 17, 18, 19, 20]  # TT06+ demo board (SDK 2.0.4's platform.py mask 0x1E1E00)
 
 
+class FakeRawPin:
+    """`StandardPin.raw_pin`, the machine.Pin behind a ui_in pin, as far as the daemon uses it: `value(v)` sets the
+    pin's output latch (the GPIO's bit of the output register), whatever its direction."""
+
+    def __init__(self, tt: FakeTT, bit: int) -> None:
+        self._tt, self._bit = tt, bit
+
+    def value(self, v=None):
+        if v is None:
+            return self._tt.ui_level(self._bit)
+        self._tt.latch_writes.append((self._bit, int(bool(v))))
+        self._tt.ui_out = (self._tt.ui_out & ~(1 << self._bit)) | (int(bool(v)) << self._bit)
+        return None
+
+
 class FakeUiPin:
     """One of the SDK's ui_in pins (`tt.pins.ui_in<k>`, a StandardPin) and the GPIO behind it. Like the SDK's, it
     keeps the mode and pull it last set (`mode`, `pull`, `is_input`): code that changes the GPIO itself, as the boot
@@ -196,6 +211,7 @@ class FakeUiPin:
     def __init__(self, tt: FakeTT, bit: int) -> None:
         self._tt, self._bit = tt, bit
         self.gpio_num = RP2040_UI_IN_GPIOS[bit]
+        self.raw_pin = FakeRawPin(tt, bit)
         self._mode = self.hw_mode = PIN_OUT  # as the SDK leaves it at its start, in ASIC_RP_CONTROL
         self._pull = self.hw_pull = PULL_DOWN
 
@@ -261,6 +277,7 @@ class FakeTT:
         # test drives while ui_in[0] is high and the HAT joins to ui_in[1:3].
         self.dip_on: set[int] = set()
         self.made_outputs: list[int] = []  # the ui_in pins made outputs, in order
+        self.latch_writes: list[tuple[int, int]] = []  # (bit, value) set through a pin's raw_pin
         self.high_pulses: list[int] = []  # ui_in pins made outputs while their register bit was 1
         self.floats_high = {0}
         self.counter = 0b0110

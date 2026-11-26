@@ -1,0 +1,45 @@
+import gc, binascii, hashlib
+import ttboard.fpga.fabricfoxv2 as _fo_loader
+from ttboard.fpga.fpga_mux import BitStream as _fo_BitStream
+class _fo_Reader:
+    def __init__(self, buf):
+        self.buf = memoryview(buf)
+        self.at = 0
+    def read(self, n):
+        data = bytes(self.buf[self.at:self.at + n])
+        self.at += len(data)
+        return data
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+try:
+    del _fo_loader.open
+except (AttributeError, KeyError):
+    pass
+_fo_ok = False
+_fo_touched = False
+try:
+    if _fo_n != 64:
+        raise ValueError('bitstream incomplete: %d of 64 bytes' % _fo_n)
+    if binascii.hexlify(hashlib.sha256(_fo_buf).digest()).decode() != 'e6e07065febfc33f96bda4c7a56bc088860a17c27ddd858d5f5c79cbbe0d9b57':
+        raise ValueError('the bitstream did not arrive as it was sent')
+    _fo_reader = _fo_Reader(_fo_buf)
+    _fo_loader.open = lambda path, mode='rb': _fo_reader
+    _fo_touched = True
+    tt.shuttle.enable(_fo_BitStream(tt.shuttle, 'pi:x.bin', 'x', -1))
+    if _fo_reader.at != 64:
+        raise ValueError('the loader read %d of 64 bytes' % _fo_reader.at)
+    _fo_ok = True
+finally:
+    try:
+        del _fo_loader.open
+    except (AttributeError, KeyError):
+        pass
+    _fo_buf = None
+    _fo_reader = None
+    gc.collect()
+    if _fo_touched and not _fo_ok:
+        tt.shuttle.enabled = None
+tt.clock_project_PWM(1000)
+print('enabled')

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from fpgas_tt import designs, library
+from fpgas_tt import designs, library, rpregs
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.designs import ValidationError, validate_bitstream
 from fpgas_tt.repl import ReplError, ReplRunner
@@ -14,6 +14,8 @@ from tests.test_library import ENTRIES
 
 DEMOS = Path(__file__).parent / "data" / "demos"
 PRE = b"\x7e\xaa\x99\x7e"
+# What an enable answers besides its name and clock when it was given no ui_in and released nothing.
+NO_UI_IN = {"ui_in": None, "ui_in_mask": 0, "ui_in_driven": [], "ui_in_held": [], "ui_in_inputs": [], "released": []}
 
 
 async def wait_for(predicate, timeout=2.0):
@@ -203,7 +205,7 @@ async def test_enable_design_loads_the_pis_file_through_the_sdk_and_writes_nothi
     before = board_tree(fake_repl)
     data = (DEMOS / "tt_um_demo_a.bin").read_bytes()
     out = await designs.enable_design(runner, "tt_um_demo_a", 1000, DEMOS, uploads)
-    assert out == {"enabled": "tt_um_demo_a", "clock_hz": 1000}
+    assert out == {"enabled": "tt_um_demo_a", "clock_hz": 1000, **NO_UI_IN}
     assert fake_repl.loaded == [("pi:tt_um_demo_a.bin", data)]  # the SDK's loader read exactly the Pi's bytes
     assert fake_repl.tt.shuttle.enable_log == ["tt_um_demo_a"] and fake_repl.tt.clock_log == [1000]
     assert (await designs.list_designs(runner, DEMOS, uploads))["enabled"] == "tt_um_demo_a"
@@ -237,7 +239,7 @@ async def test_enable_design_applies_explicit_zero_clock_hz(runner, fake_repl, u
     # clock_hz=0 is a legitimate explicit value, distinct from "no clock_hz
     # given" (clock_hz=None) -- it must still reach tt.clock_project_PWM.
     out = await designs.enable_design(runner, "tt_um_demo_a", 0, DEMOS, uploads)
-    assert out == {"enabled": "tt_um_demo_a", "clock_hz": 0}
+    assert out == {"enabled": "tt_um_demo_a", "clock_hz": 0, **NO_UI_IN}
     assert fake_repl.tt.clock_log == [0]
 
 
@@ -325,8 +327,8 @@ async def test_a_load_that_failed_is_not_reported_as_loaded(runner, fake_repl, u
 async def test_a_bitstream_that_did_not_arrive_as_sent_is_not_loaded(runner, fake_repl, uploads, monkeypatch):
     real = designs._load_steps
 
-    def corrupted(name, data, clock_hz):
-        steps = real(name, data, clock_hz)
+    def corrupted(name, data, clock_hz, **kwargs):
+        steps = real(name, data, clock_hz, **kwargs)
         return [*steps[:-1], "_fo_buf[5] ^= 0xff\n", steps[-1]]
 
     monkeypatch.setattr(designs, "_load_steps", corrupted)
@@ -342,8 +344,8 @@ async def test_a_load_refused_before_the_fpga_is_touched_leaves_the_running_desi
     await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
     real = designs._load_steps
 
-    def corrupted(name, data, clock_hz):
-        steps = real(name, data, clock_hz)
+    def corrupted(name, data, clock_hz, **kwargs):
+        steps = real(name, data, clock_hz, **kwargs)
         return [*steps[:-1], "_fo_buf[5] ^= 0xff\n", steps[-1]]
 
     monkeypatch.setattr(designs, "_load_steps", corrupted)
@@ -550,7 +552,8 @@ async def test_enable_reads_library_bin_and_touches_lru(runner, fake_repl, uploa
     library.store(lib, id, sha, data, 1 << 20)
     os.utime(lib / f"{id}.json", (1000, 1000))
     out = await designs.enable_design(runner, id, 25_175_000, DEMOS, uploads, library_dir=lib)
-    assert out == {"enabled": id, "clock_hz": 25_175_000}
+    assert out == {"enabled": id, "clock_hz": 25_175_000, "ui_in": None, "ui_in_mask": 0, "ui_in_driven": [],
+                   "ui_in_held": [], "ui_in_inputs": list(range(8)), "released": []}  # a library load: all eight inputs
     assert fake_repl.loaded == [(f"pi:{id}.bin", data)]
     assert (lib / f"{id}.json").stat().st_mtime > 1000
 
@@ -561,3 +564,269 @@ async def test_a_library_entry_evicted_before_the_enable_is_not_found(runner, fa
     with pytest.raises(designs.DesignNotFound):
         await designs.enable_design(runner, ENTRIES[0][0], None, DEMOS, uploads, library_dir=lib)
     assert fake_repl.transcript == b""
+
+
+# -- ui_in: what the daemon drove is released on every load; only ui_in_mask bits are driven (spec Ruling AD) --
+
+D = PRE + bytes(60)
+GUARD_LINES = [
+    "_fo_p.mode = Pin.IN",
+    "_fo_p.pull = Pin.PULL_DOWN",
+    "time.sleep_ms(5)",
+    "if _fo_p():",
+    "    _fo_held.append(_fo_i)",
+    "    continue",
+]
+
+
+def _between(text: str, start: str, end: str) -> str:
+    i = text.index(start)
+    return text[i : text.index(end, i)]
+
+
+def test_ui_in_guard_text():
+    assert designs.ui_in_guard(4, "_fo_held") == "".join(f"    {line}\n" for line in GUARD_LINES)
+    assert "        _fo_held.append(_fo_i)\n" in designs.ui_in_guard(4, "_fo_held")
+
+
+def test_release_block_on_every_load():
+    masked = {"ui_in": 1, "ui_in_mask": 1}
+    for kwargs in ({}, masked, {"library": True}, {**masked, "library": True}):
+        step = designs._load_steps("x", D, None, **kwargs)[-1]
+        hash_check = step.index("raise ValueError('the bitstream did not arrive as it was sent')")
+        before = min(step.index("_fo_reader = _fo_Reader("), step.index("_fo_touched = True"))
+        for piece in ("globals().get('_fo_ui_driven')", rpregs.GPIO_OE_EXPR, "time.sleep_ms(1)", "Pin.PULL_DOWN",
+                      "print('released=' + json.dumps("):  # fmt: skip
+            assert hash_check < step.index(piece) < before, piece
+        for module in ("import machine, time, json\n", "from machine import Pin\n"):
+            assert hash_check < step.index(module) < before
+        assert "import sys" not in step
+
+
+def test_release_discharges_only_daemon_driven_pins():
+    step = designs._load_steps("x", D, None, ui_in=1, ui_in_mask=1, library=True)[-1]
+    driven = _between(step, "    for _fo_i in _fo_prev:\n", "    _fo_inputs = [")
+    # the latch-0 write and the 1 ms sit under the GPIO_OE test, and come before Pin.IN, then Pin.PULL_DOWN
+    test = driven.index("        if _fo_oe >> _fo_p.gpio_num & 1:\n")
+    latch = driven.index("            _fo_p.raw_pin.value(0)\n")
+    wait = driven.index("            time.sleep_ms(1)\n")
+    made_input = driven.index("        _fo_p.mode = Pin.IN\n")
+    pull = driven.index("        _fo_p.pull = Pin.PULL_DOWN\n")
+    assert test < latch < wait < made_input < pull
+    assert f"    _fo_oe = machine.mem32[{rpregs.GPIO_OE_EXPR}]\n" in step
+    # the other released pins: the unmasked bits that the daemon did not drive, straight to inputs
+    assert "    _fo_inputs = [_fo_i for _fo_i in [1, 2, 3, 4, 5, 6, 7] if _fo_i not in _fo_prev]\n" in step
+    others = _between(step, "    for _fo_i in _fo_inputs:\n", "    _fo_ui_driven = []\n")
+    assert others.index("Pin.IN") < others.index("Pin.PULL_DOWN")
+    for never in ("Pin.OUT", "raw_pin.value(", "sleep_ms"):
+        assert never not in others
+
+
+def test_library_release_includes_unmasked_bits():
+    def extra(**kwargs) -> str:
+        step = designs._load_steps("x", D, None, **kwargs)[-1]
+        assert "globals().get('_fo_ui_driven')" in step  # _fo_ui_driven, always
+        return _between(step, "    _fo_inputs = [_fo_i for _fo_i in ", " if _fo_i not in _fo_prev]")
+
+    assert extra(ui_in=1, ui_in_mask=1, library=True).endswith("[1, 2, 3, 4, 5, 6, 7]")
+    assert extra(ui_in=None, ui_in_mask=0, library=True).endswith(repr(list(range(8))))
+    assert extra(ui_in=0x81, ui_in_mask=0x81, library=True).endswith("[1, 2, 3, 4, 5, 6]")
+    assert extra(ui_in=1, ui_in_mask=1, library=False).endswith("[]")
+    assert extra().endswith("[]")
+
+
+def test_no_drive_block_when_mask_zero():
+    for kwargs in ({"ui_in": None, "ui_in_mask": 0}, {"ui_in": None, "ui_in_mask": 0, "library": True}):
+        step = designs._load_steps("x", D, 1000, **kwargs)[-1]
+        assert "raw_pin.value((" not in step and "print('ui_in='" not in step
+        assert step.endswith("tt.clock_project_PWM(1000)\nprint('enabled')\n")
+
+
+def test_drive_block_never_touches_mode_or_clock():
+    steps = designs._load_steps("x", D, 1000, ui_in=1, ui_in_mask=1)
+    step = steps[-1]
+    for text in ("".join(steps), designs.LOAD_CODE, designs.RELEASE_CODE, designs.DRIVE_CODE):
+        for never in ("tt.mode", "clock_project_stop", "RPMode"):
+            assert never not in text
+    drive = "".join(
+        [
+            "from machine import Pin\n",
+            "import time, json\n",
+            "_fo_tt = tt\n",
+            "_fo_held = []\n",
+            "_fo_ui_driven = []\n",
+            "for _fo_i in range(8):\n",
+            "    if not (1 >> _fo_i) & 1:\n",
+            "        continue\n",
+            "    _fo_p = getattr(_fo_tt.pins, 'ui_in%d' % _fo_i)\n",
+            *(f"    {line}\n" for line in GUARD_LINES),
+            "    _fo_p.raw_pin.value((1 >> _fo_i) & 1)\n",
+            "    _fo_p.mode = Pin.OUT\n",
+            "    _fo_ui_driven.append(_fo_i)\n",
+            "print('ui_in=' + json.dumps({'driven': _fo_ui_driven, 'held': _fo_held}))\n",
+        ]
+    )
+    assert drive in step  # the spec's block, as written there
+    loop = _between(step, "for _fo_i in range(8):\n    if not (1", "print('ui_in='")
+    assert loop.index("raw_pin.value((1 >> _fo_i) & 1)") < loop.index("_fo_p.mode = Pin.OUT")
+    at = step.index(drive)
+    assert step.index("tt.clock_project_PWM(1000)\n") < at and step.index("finally:\n") < at
+    assert step.splitlines()[-1] == "print('enabled')"
+
+
+class _Says:
+    """A REPL runner whose board answers the load's last step with `last`."""
+
+    def __init__(self, last: str) -> None:
+        self.last = last
+
+    async def exec_steps(self, steps, **kwargs):
+        return [*(["ok"] * (len(steps) - 1)), self.last]
+
+
+async def test_load_design_parses_released_driven_held(monkeypatch):
+    parsed = []
+    real = designs._parse_json
+    monkeypatch.setattr(designs, "_parse_json", lambda out: parsed.append(out) or real(out))
+    said = (
+        'released={"released": [0], "inputs": [1, 2, 3, 4, 5, 6, 7]}\r\n'
+        'ui_in={"driven": [0], "held": []}\r\nenabled\r\n'
+    )
+    out = await designs.load_design(_Says(said), "x", D, None, ui_in=1, ui_in_mask=1, library=True)
+    assert out == {"released": [0], "ui_in_driven": [0], "ui_in_held": [], "ui_in_inputs": [1, 2, 3, 4, 5, 6, 7]}
+    assert parsed == ['{"released": [0], "inputs": [1, 2, 3, 4, 5, 6, 7]}', '{"driven": [0], "held": []}']
+    # no drive block: nothing driven, nothing held
+    out = await designs.load_design(_Says('released={"released": [], "inputs": []}\r\nenabled\r\n'), "x", D, None)
+    assert out == {"released": [], "ui_in_driven": [], "ui_in_held": [], "ui_in_inputs": []}
+    for bad in ("enabled\r\n", 'released={"released": [0], "inputs": [1]\r\nenabled\r\n',
+                'released={"released": [9], "inputs": []}\r\nenabled\r\n',
+                'released={"released": [true], "inputs": []}\r\nenabled\r\n',
+                'released={"released": [], "inputs": []}\r\nui_in=[0]\r\nenabled\r\n'):  # fmt: skip
+        with pytest.raises(ReplError):
+            await designs.load_design(_Says(bad), "x", D, None)
+    # a drive block was sent, so its answer line is required
+    with pytest.raises(ReplError, match="drives"):
+        await designs.load_design(_Says('released={"released": [], "inputs": []}\r\nenabled\r\n'), "x", D, None,
+                                  ui_in=1, ui_in_mask=1)  # fmt: skip
+    with pytest.raises(ReplError, match="made inputs"):
+        await designs.load_design(_Says('released={"released": [], "inputs": [8]}\r\nenabled\r\n'), "x", D, None)
+
+
+def _pins(fake_repl) -> list[tuple[int, object]]:
+    return [(fake_repl.tt.ui_pin(k).hw_mode, fake_repl.tt.ui_pin(k).hw_pull) for k in range(8)]
+
+
+async def test_release_reports_two_lists(runner, fake_repl, uploads, lib):
+    assert fake_repl.chip == "rp2350"
+    id, sha, data = ENTRIES[1]
+    library.store(lib, id, sha, data, 1 << 20)
+    other = _stored(lib, 0)
+    first = await designs.enable_design(runner, other, None, DEMOS, uploads, library_dir=lib, ui_in=1, ui_in_mask=1)
+    assert (first["released"], first["ui_in_inputs"], first["ui_in_driven"]) == ([], [1, 2, 3, 4, 5, 6, 7], [0])
+    assert fake_repl._globals["_fo_ui_driven"] == [0]
+    outputs, latches = len(fake_repl.tt.made_outputs), len(fake_repl.tt.latch_writes)
+    out = await designs.enable_design(runner, id, None, DEMOS, uploads, library_dir=lib, ui_in=1, ui_in_mask=1)
+    assert out == {"enabled": id, "clock_hz": None, "ui_in": 1, "ui_in_mask": 1, "ui_in_driven": [0],
+                   "ui_in_held": [], "ui_in_inputs": [1, 2, 3, 4, 5, 6, 7], "released": [0]}  # fmt: skip
+    # bit 0 was discharged (latch 0) and released, then driven again; no other pin was made an output
+    assert fake_repl.tt.latch_writes[latches:] == [(0, 0), (0, 1)]
+    assert fake_repl.tt.made_outputs[outputs:] == [0]
+    assert _pins(fake_repl)[1:] == [(0, 2)] * 7  # Pin.IN, Pin.PULL_DOWN
+    # a bit both driven before and outside the new mask is listed only under `released`
+    out = await designs.enable_design(runner, id, None, DEMOS, uploads, library_dir=lib, ui_in=2, ui_in_mask=2)
+    assert (out["released"], out["ui_in_inputs"], out["ui_in_driven"]) == ([0], [2, 3, 4, 5, 6, 7], [1])
+    assert _pins(fake_repl)[0] == (0, 2)
+    # a mask of 0 makes all eight bits inputs
+    out = await designs.enable_design(runner, id, None, DEMOS, uploads, library_dir=lib)
+    assert (out["released"], out["ui_in_inputs"], out["ui_in_driven"]) == ([1], [0, 2, 3, 4, 5, 6, 7], [])
+    assert _pins(fake_repl) == [(0, 2)] * 8 and fake_repl._globals["_fo_ui_driven"] == []
+
+
+def _stored(lib: Path, k: int = 1) -> str:
+    """Library entry ENTRIES[k], kept in `lib`: its id."""
+    library.store(lib, *ENTRIES[k], 1 << 20)
+    return ENTRIES[k][0]
+
+
+async def _drive_bit_0(runner, uploads, lib) -> None:
+    """A library load that drives ui_in[0] high (and makes ui_in[1:7] inputs)."""
+    out = await designs.enable_design(runner, _stored(lib), None, DEMOS, uploads, library_dir=lib, ui_in=1,
+                                      ui_in_mask=1)  # fmt: skip
+    assert out["ui_in_driven"] == [0]
+
+
+async def test_release_frees_only_daemon_driven_pins(runner, fake_repl, uploads, lib):
+    await _drive_bit_0(runner, uploads, lib)
+    # the visitor's own write_ui_in, through the Commander, sets bit 1: the chip drives it high
+    tt = fake_repl.tt
+    tt.ui_pin(1).mode = 1
+    tt.ui_in.value = tt.ui_out | 0b10
+    latches = len(tt.latch_writes)
+    out = await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads, library_dir=lib)
+    assert (out["released"], out["ui_in_inputs"], out["ui_in_driven"], out["ui_in_held"]) == ([0], [], [], [])
+    assert tt.latch_writes[latches:] == [(0, 0)]  # only bit 0 discharged
+    assert tt.ui_pin(1).hw_mode == 1 and tt.ui_out >> 1 & 1 and tt.ui_level(1) == 1  # bit 1 untouched
+    assert _pins(fake_repl)[0] == (0, 2)
+
+
+async def test_a_released_pin_the_chip_no_longer_drives_is_not_made_an_output(runner, fake_repl, uploads, lib):
+    await _drive_bit_0(runner, uploads, lib)
+    fake_repl.tt.ui_pin(0).hw_mode = 0  # something let go of it behind the daemon's back
+    outputs, latches = len(fake_repl.tt.made_outputs), len(fake_repl.tt.latch_writes)
+    out = await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
+    assert out["released"] == [0]
+    assert fake_repl.tt.latch_writes[latches:] == [] and fake_repl.tt.made_outputs[outputs:] == []
+
+
+async def test_release_exception_keeps_enabled_name(runner, fake_repl, uploads):
+    await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    fake_repl._globals["_fo_ui_driven"] = [0]
+    fake_repl.tt.pins.ui_in0 = object()  # a pin with no gpio_num: the release raises
+    with pytest.raises(ReplError):
+        await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
+    assert (await designs.list_designs(runner, DEMOS, uploads))["enabled"] == "tt_um_demo_a"
+    assert [name for name, _ in fake_repl.loaded] == ["pi:tt_um_demo_a.bin"]  # the FPGA was never touched
+
+
+async def test_a_held_mask_bit_is_left_an_input(runner, fake_repl, uploads, lib):
+    fake_repl.tt.dip_on, fake_repl.tt.counter = {2}, 0  # an FPGA board: no factory test on uio
+    out = await designs.enable_design(runner, _stored(lib), None, DEMOS, uploads, library_dir=lib, ui_in=0b101,
+                                      ui_in_mask=0b111)  # fmt: skip
+    assert (out["ui_in_driven"], out["ui_in_held"]) == ([0, 1], [2])
+    assert fake_repl._globals["_fo_ui_driven"] == [0, 1]
+
+
+async def test_a_failed_load_drives_nothing(runner, fake_repl, uploads, lib, monkeypatch):
+    monkeypatch.setattr(fake_repl.loader, "spi_transferPIO", lambda filepath, freq=1_000_000: None)
+    outputs = len(fake_repl.tt.made_outputs)
+    with pytest.raises(ReplError):
+        await designs.enable_design(runner, _stored(lib), None, DEMOS, uploads, library_dir=lib, ui_in=1,
+                                    ui_in_mask=1)  # fmt: skip
+    assert fake_repl.tt.made_outputs[outputs:] == [] and fake_repl._globals["_fo_ui_driven"] == []
+
+
+async def test_a_damaged_driven_list_does_not_wedge_later_loads(runner, fake_repl, uploads):
+    """Only ints 0..7 of a board-side _fo_ui_driven are released; the rest is dropped, and the list is cleared."""
+    fake_repl._globals["_fo_ui_driven"] = [9, "x", -1, None, 0]
+    out = await designs.enable_design(runner, "tt_um_demo_a", None, DEMOS, uploads)
+    assert out["released"] == [0] and fake_repl._globals["_fo_ui_driven"] == []
+    out = await designs.enable_design(runner, "tt_um_demo_b", None, DEMOS, uploads)
+    assert out["released"] == [] and (await designs.list_designs(runner, DEMOS, uploads))["enabled"] == "tt_um_demo_b"
+
+
+@pytest.mark.parametrize(
+    "ui_in,mask,given", [(1, 1, True), (None, 0, True), (None, 1, False), (0, 0, False)]
+)
+@pytest.mark.parametrize("source", ["demo", "upload"])
+async def test_ui_in_is_only_for_library_designs(runner, fake_repl, uploads, lib, source, ui_in, mask, given):
+    """Ruling BA: ui_in is tied to uio on the Welland HAT; only a library entry's published mask may drive it."""
+    name = "tt_um_demo_a"
+    if source == "upload":
+        name = "my_upload"
+        designs.store_upload(uploads, name, PRE)
+    _stored(lib)
+    with pytest.raises(ValidationError) as ei:
+        await designs.enable_design(runner, name, None, DEMOS, uploads, library_dir=lib, ui_in=ui_in,
+                                    ui_in_mask=mask, ui_in_given=given)  # fmt: skip
+    assert (ei.value.status, str(ei.value)) == (400, "ui_in is only for VGA library designs")
+    assert fake_repl.transcript == b""  # refused before the board was asked

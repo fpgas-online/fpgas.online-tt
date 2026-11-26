@@ -33,6 +33,7 @@ from pathlib import Path
 
 from fpgas_tt import library
 from fpgas_tt.repl import ReplBusy, ReplError, ReplRunner
+from fpgas_tt.rpregs import GPIO_OE_EXPR
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,9 @@ ENABLE_LEAST = 8.0
 # It is not a design of the Pi's gallery, so no upload may take it: a page marks as running the listed design
 # whose name the SDK gives.
 IDLE_NAME = "idle_display"
+# Ruling BA: ui_in pins are tied to uio on the Welland HAT, so only a library entry, whose mask the harness
+# published, may have them driven.
+UI_IN_LIBRARY_ONLY = "ui_in is only for VGA library designs"
 
 class ValidationError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
@@ -257,7 +261,9 @@ print('buffer')
 # before it has transferred it, and its loader prints an OSError instead of raising it: so a load that failed
 # once the FPGA was touched, or did not read every byte, leaves `tt.shuttle.enabled` as None, never the design's
 # name. A load refused before that (an incomplete or damaged buffer) leaves the running design, and its name,
-# as they were.
+# as they were. Once the buffer is known good, and before the FPGA is touched, the ui_in pins are released
+# (RELEASE_CODE); only after the load and its clock, and only when it succeeded, are the ui_in_mask bits driven
+# (DRIVE_CODE). Nothing here sets `tt.mode` or stops the project clock (spec Ruling AD).
 LOAD_CODE = """\
 import gc, binascii, hashlib
 import ttboard.fpga.fabricfoxv2 as _fo_loader
@@ -285,7 +291,7 @@ try:
         raise ValueError('bitstream incomplete: %d of __SIZE__ bytes' % _fo_n)
     if binascii.hexlify(hashlib.sha256(_fo_buf).digest()).decode() != __SHA256__:
         raise ValueError('the bitstream did not arrive as it was sent')
-    _fo_reader = _fo_Reader(_fo_buf)
+__RELEASE__    _fo_reader = _fo_Reader(_fo_buf)
     _fo_loader.open = lambda path, mode='rb': _fo_reader
     _fo_touched = True
     tt.shuttle.enable(_fo_BitStream(tt.shuttle, __PATH__, __NAME__, -1))
@@ -302,12 +308,86 @@ finally:
     gc.collect()
     if _fo_touched and not _fo_ok:
         tt.shuttle.enabled = None
-__CLOCK__print('enabled')
+__CLOCK____DRIVE__print('enabled')
 """
 
 
-def _load_steps(name: str, data: bytes, clock_hz: int | None) -> list[str]:
-    """The REPL steps that put `data` into a buffer in the board's memory and have the SDK load it."""
+def ui_in_guard(indent: int, held: str) -> str:
+    """The SDK's contention guard for one ui_in pin, each line indented by `indent` spaces: the pin is made an
+    input with the pull-down, and a pin that still reads high is added to the list `held` and skipped. The caller
+    has bound `_fo_p` and `_fo_i`, imported `Pin` and `time`, and is inside a `for` loop. SAFE_CODE and DRIVE_CODE
+    both use it."""
+    lines = (
+        "_fo_p.mode = Pin.IN",
+        "_fo_p.pull = Pin.PULL_DOWN",
+        "time.sleep_ms(5)",
+        "if _fo_p():",
+        f"    {held}.append(_fo_i)",
+        "    continue",
+    )
+    return "".join(" " * indent + line + "\n" for line in lines)
+
+
+# Inside LOAD_CODE's `try`, after the hash check and before the FPGA is touched (spec Ruling AF). `_fo_ui_driven`
+# is the board-side list of the ui_in bits the daemon drove for the previous load. Such a pin that the chip's
+# GPIO_OE says it still drives is first set low for 1 ms, which discharges the pad (RP2350-E9); then it is an
+# input with the pull-down. The other pins released (__EXTRA__: on a library load, the bits outside its
+# ui_in_mask) go straight to an input with the pull-down and are never made an output.
+RELEASE_CODE = (
+    "    import machine, time, json\n"
+    "    from machine import Pin\n"
+    # only ints 0..7: a list damaged by hand cannot wedge every later load
+    "    _fo_prev = [i for i in (globals().get('_fo_ui_driven') or []) if isinstance(i, int) and 0 <= i < 8]\n"
+    "    _fo_oe = machine.mem32[" + GPIO_OE_EXPR + "]\n"
+    "    for _fo_i in _fo_prev:\n"
+    "        _fo_p = getattr(tt.pins, 'ui_in%d' % _fo_i)\n"
+    "        if _fo_oe >> _fo_p.gpio_num & 1:\n"
+    "            _fo_p.raw_pin.value(0)\n"
+    "            time.sleep_ms(1)\n"
+    "        _fo_p.mode = Pin.IN\n"
+    "        _fo_p.pull = Pin.PULL_DOWN\n"
+    "    _fo_inputs = [_fo_i for _fo_i in __EXTRA__ if _fo_i not in _fo_prev]\n"
+    "    for _fo_i in _fo_inputs:\n"
+    "        _fo_p = getattr(tt.pins, 'ui_in%d' % _fo_i)\n"
+    "        _fo_p.mode = Pin.IN\n"
+    "        _fo_p.pull = Pin.PULL_DOWN\n"
+    "    _fo_ui_driven = []\n"
+    "    print('released=' + json.dumps({'released': _fo_prev, 'inputs': _fo_inputs}))\n"
+)
+
+# After the load and its clock, reached only when the load succeeded: each bit of __MASK__ that does not read
+# high with the pull-down gets its latch set to its bit of __UI_IN__ and only then becomes an output. Only these
+# bits are recorded in `_fo_ui_driven`.
+DRIVE_CODE = (
+    "from machine import Pin\n"
+    "import time, json\n"
+    "_fo_tt = tt\n"
+    "_fo_held = []\n"
+    "_fo_ui_driven = []\n"
+    "for _fo_i in range(8):\n"
+    "    if not (__MASK__ >> _fo_i) & 1:\n"
+    "        continue\n"
+    "    _fo_p = getattr(_fo_tt.pins, 'ui_in%d' % _fo_i)\n"
+    + ui_in_guard(4, "_fo_held")
+    + "    _fo_p.raw_pin.value((__UI_IN__ >> _fo_i) & 1)\n"
+    "    _fo_p.mode = Pin.OUT\n"
+    "    _fo_ui_driven.append(_fo_i)\n"
+    "print('ui_in=' + json.dumps({'driven': _fo_ui_driven, 'held': _fo_held}))\n"
+)
+
+
+def _load_steps(
+    name: str, data: bytes, clock_hz: int | None, *, ui_in: int | None = None, ui_in_mask: int = 0,
+    library: bool = False,
+) -> list[str]:  # fmt: skip
+    """The REPL steps that put `data` into a buffer in the board's memory and have the SDK load it. Every load
+    releases the ui_in bits the daemon drove before; a `library` load also releases every bit outside
+    `ui_in_mask`. With a `ui_in` and a mask other than 0, the mask's bits are driven to `ui_in` once loaded."""
+    extra = [i for i in range(8) if not (ui_in_mask >> i) & 1] if library else []
+    release = RELEASE_CODE.replace("__EXTRA__", repr(extra))
+    drive = ""
+    if ui_in is not None and ui_in_mask:
+        drive = DRIVE_CODE.replace("__MASK__", str(int(ui_in_mask))).replace("__UI_IN__", str(int(ui_in)))
     steps = [BUFFER_CODE.replace("__SIZE__", str(len(data)))]
     for i in range(0, len(data), CHUNK):
         b64 = base64.b64encode(data[i : i + CHUNK]).decode("ascii")
@@ -321,6 +401,8 @@ def _load_steps(name: str, data: bytes, clock_hz: int | None) -> list[str]:
         .replace("__PATH__", repr(f"pi:{name}.bin"))  # not a path on the board: the reader never looks at it
         .replace("__NAME__", repr(name))
         .replace("__CLOCK__", clock)
+        .replace("__DRIVE__", drive)
+        .replace("__RELEASE__", release)
     )
     return steps
 
@@ -334,16 +416,18 @@ def _listing(demos_dir: Path, uploads_dir: Path, library_dir: Path | None) -> tu
     return [_meta(n, demos, sizes) for n in sorted(names)], sum(sizes.values())
 
 
-def _read_design(demos_dir: Path, uploads_dir: Path, name: str, library_dir: Path | None = None) -> bytes:
-    """The bytes of design `name`. Reading a library entry counts as using it: its LRU time is refreshed."""
+def _read_design(demos_dir: Path, uploads_dir: Path, name: str, library_dir: Path | None = None) -> tuple[bytes, bool]:
+    """The bytes of design `name`, and whether they are a library entry's. Reading a library entry counts as
+    using it: its LRU time is refreshed."""
     path = design_file(demos_dir, uploads_dir, name, library_dir=library_dir)
     try:
         data = path.read_bytes()
     except FileNotFoundError as exc:  # removed to make room, between finding it and reading it
         raise DesignNotFound(name) from exc
-    if library_dir is not None and path == library.bin_path(library_dir, name):
+    is_library = library_dir is not None and path == library.bin_path(library_dir, name)
+    if is_library:
         library.touch(library_dir, name)
-    return data
+    return data, is_library
 
 
 async def ensure_sdk(runner: ReplRunner) -> None:
@@ -380,12 +464,21 @@ async def enable_design(
     uploads_dir: Path,
     *,
     library_dir: Path | None = None,
+    ui_in: int | None = None,
+    ui_in_mask: int = 0,
+    ui_in_given: bool = False,
     waited: float = 0.0,
 ) -> dict:
     """Load design `name`. `waited` is what the caller already spent waiting for the board: it comes out of
-    the deadline, which is the caller's whole request's, the start of the SDK included."""
+    the deadline, which is the caller's whole request's, the start of the SDK included. `ui_in` and
+    `ui_in_mask` are the caller's (the server has checked them): a library entry gets the release of every bit
+    outside its mask. They are only for a library entry (Ruling BA): for a demo or an upload, any value, or
+    `ui_in_given` (the request carried either key, even as null or 0), is a ValidationError before the board
+    is touched."""
     # design_file refuses a name the Pi could never have before anything goes near the board.
-    data = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name, library_dir)
+    data, is_library = await asyncio.to_thread(_read_design, demos_dir, uploads_dir, name, library_dir)
+    if not is_library and (ui_in_given or ui_in is not None or ui_in_mask):
+        raise ValidationError(UI_IN_LIBRARY_ONLY)
     started = time.monotonic() - waited
     if ENABLE_OVERALL_TIMEOUT - waited < ENABLE_LEAST:
         raise ReplBusy("the board was busy for too long; try again")
@@ -394,19 +487,63 @@ async def enable_design(
             await ensure_sdk(runner)
             # What starting the SDK took comes out of the load's deadline.
             left = ENABLE_OVERALL_TIMEOUT - (time.monotonic() - started)
-            await load_design(runner, name, data, clock_hz, overall=left)
+            pins = await load_design(runner, name, data, clock_hz, ui_in=ui_in, ui_in_mask=ui_in_mask,
+                                     library=is_library, overall=left)  # fmt: skip
     except TimeoutError as exc:
         raise ReplError("the load did not finish in time") from exc
-    return {"enabled": name, "clock_hz": clock_hz}
+    return {"enabled": name, "clock_hz": clock_hz, "ui_in": ui_in, "ui_in_mask": ui_in_mask,
+            "ui_in_driven": pins["ui_in_driven"], "ui_in_held": pins["ui_in_held"],
+            "ui_in_inputs": pins["ui_in_inputs"], "released": pins["released"]}  # fmt: skip
+
+
+def _bits(value, what: str, out: str) -> list[int]:
+    if not (isinstance(value, list) and all(isinstance(i, int) and not isinstance(i, bool) and 0 <= i < 8
+                                            for i in value)):  # fmt: skip
+        raise ReplError(f"the board did not say which ui_in pins it {what}", out)
+    return value
+
+
+def _line(lines: list[str], prefix: str, out: str) -> dict | None:
+    found = [line[len(prefix) :] for line in lines if line.startswith(prefix)]
+    if not found:
+        return None
+    reply = _parse_json(found[-1])
+    if not isinstance(reply, dict):
+        raise ReplError(f"the board's {prefix} line is not an object", out)
+    return reply
 
 
 async def load_design(
-    runner: ReplRunner, name: str, data: bytes, clock_hz: int | None, *, overall: float = ENABLE_OVERALL_TIMEOUT
-) -> None:
+    runner: ReplRunner,
+    name: str,
+    data: bytes,
+    clock_hz: int | None,
+    *,
+    ui_in: int | None = None,
+    ui_in_mask: int = 0,
+    library: bool = False,
+    overall: float = ENABLE_OVERALL_TIMEOUT,
+) -> dict:
     """Stream `data` into the FPGA through the SDK that is running on the board, under the name `name`. The
-    SDK is not started here: a board without it fails the load."""
+    SDK is not started here: a board without it fails the load. The answer says which ui_in bits were released
+    (`released`: driven by the daemon before; `ui_in_inputs`: the others a library load made inputs) and which
+    are now driven (`ui_in_driven`) or were left inputs because something held them high (`ui_in_held`)."""
     # timeout (per-read) stays 30s -- the SPI load takes a few seconds and any single read waiting on it is
     # normal; overall is intentionally tighter (see ENABLE_OVERALL_TIMEOUT).
-    outs = await runner.exec_steps(_load_steps(name, data, clock_hz), timeout=30.0, overall=max(5.0, overall))
-    if outs[-1].strip().splitlines()[-1:] != ["enabled"]:
+    steps = _load_steps(name, data, clock_hz, ui_in=ui_in, ui_in_mask=ui_in_mask, library=library)
+    outs = await runner.exec_steps(steps, timeout=30.0, overall=max(5.0, overall))
+    lines = [line.strip() for line in outs[-1].strip().splitlines()]
+    if lines[-1:] != ["enabled"]:
         raise ReplError("the board did not confirm the load", outs[-1])
+    released = _line(lines, "released=", outs[-1])
+    if released is None:
+        raise ReplError("the board did not say which ui_in pins it released", outs[-1])
+    driven = _line(lines, "ui_in=", outs[-1])
+    if driven is None:
+        if ui_in is not None and ui_in_mask:  # a drive block was sent: it must have answered
+            raise ReplError("the board did not say which ui_in pins it drives", outs[-1])
+        driven = {"driven": [], "held": []}
+    return {"released": _bits(released.get("released"), "released", outs[-1]),
+            "ui_in_driven": _bits(driven.get("driven"), "drives", outs[-1]),
+            "ui_in_held": _bits(driven.get("held"), "left as inputs", outs[-1]),
+            "ui_in_inputs": _bits(released.get("inputs"), "made inputs", outs[-1])}  # fmt: skip

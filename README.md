@@ -66,7 +66,7 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   | Route | Description |
   |-------|-------------|
   | `GET /designs` | `{"enabled": str\|null, "library": {"max_bytes", "used_bytes"}, "designs": [{"name", "title", "author", "description", "docs_url", "repo_url", "clock_hz", "pinout", "source": "demo"\|"library"\|"upload"}, ...]}` — every demo whose `.bin` is on the Pi, with its metadata from `index.json`, every library entry kept here and every upload; a library entry has an upload's placeholders (`""`, `clock_hz` null, `pinout` `{}`) plus `size`, since its metadata is in the site's index; `enabled` is what the board's SDK says is loaded (`null` when the SDK is not running) |
-  | `POST /designs/{name}/enable` | body `{"clock_hz": int}` (optional) → `{"enabled": name, "clock_hz": int\|null}`; if the board's SDK is not running, does what the Commander does in that case (a soft reset from the friendly REPL: Ctrl-C twice, Ctrl-B, Ctrl-D, which runs the board's own `main.py`), then sends the bitstream and loads it; bounded to a 25 s overall REPL deadline (below the site proxy's own 30 s/45 s read timeouts, so a stuck load still gets a clean 502 from this daemon instead of the client seeing a raw connection reset); loading a library entry refreshes its LRU time |
+  | `POST /designs/{name}/enable` | body `{"clock_hz": int\|null, "ui_in": int\|null, "ui_in_mask": int}`, every key optional (see "Driving `ui_in`" below) → `{"enabled": name, "clock_hz": int\|null, "ui_in": int\|null, "ui_in_mask": int, "ui_in_driven": [int], "ui_in_held": [int], "ui_in_inputs": [int], "released": [int]}`; if the board's SDK is not running, does what the Commander does in that case (a soft reset from the friendly REPL: Ctrl-C twice, Ctrl-B, Ctrl-D, which runs the board's own `main.py`), then sends the bitstream and loads it; bounded to a 25 s overall REPL deadline (below the site proxy's own 30 s/45 s read timeouts, so a stuck load still gets a clean 502 from this daemon instead of the client seeing a raw connection reset); loading a library entry refreshes its LRU time |
   | `POST /bitstream` | multipart form (`name`, `file`) → `201 {"name", "size", "evicted": [str, ...]}`; kept on the Pi, the board is not involved; rejects names that collide with a demo or a cached library entry (409), non-`[a-z0-9_]{1,40}` names, oversize (>256 KiB) or non-iCE40 files (400); removes the oldest uploads first so at most 16 remain |
   | `GET /library` | `{"max_bytes", "used_bytes", "entries": [{"id", "bin_sha256", "bin_bytes", "used_at"}, ...]}`; never asks the board |
   | `POST /library/{id}` | multipart form (`meta`: `{"id", "bin_sha256", "bin_bytes"}`, at most 4 KiB; `file`, at most 256 KiB) → `201`, or `200` when the same `bin_sha256` is already kept, `{"id", "bin_bytes", "bin_sha256", "evicted": [str, ...], "hides_upload": bool}`; checks the meta's keys and types, that `meta.id` is `{id}`, that `{id}` is not a demo's or `idle_display` (409), and the file's size, SHA-256, size cap and preamble (400); the board is not involved |
@@ -121,6 +121,50 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   window of microseconds), gets 404 or loads a hidden upload of the same
   name. An entry evicted between a push and an enable
   makes the enable answer 404, and the site may push again.
+- **Driving `ui_in`** (`designs.py`'s `RELEASE_CODE` and `DRIVE_CODE`). The
+  daemon never sets `tt.mode`, never stops the project clock and never uses
+  the SDK's "MCU controls inputs" mode; it sets the `ui_in` pins directly.
+  The enable body's `ui_in_mask` (0 to 255, default 0) names the bits to
+  drive and `ui_in` (0 to 255, or null) their values: `ui_in` may have no
+  bit outside the mask, a mask other than 0 needs a `ui_in`, and a mask of 0
+  needs `ui_in` null. The caller
+  always supplies them (the site reads a library entry's from its index); the
+  daemon never fills them in. They are only for a VGA library entry: an
+  enable of a demo or an upload whose body has either key, even null or 0,
+  is refused with `400 ui_in is only for VGA library designs` before the
+  board is asked. The `ui_in` pins share nets with `uio` on the Welland HAT,
+  so only a mask the harness published may drive them.
+
+  | Pins | Condition | Steps |
+  |------|-----------|-------|
+  | each bit in `_fo_ui_driven` | `GPIO_OE` shows it driven | latch 0; output for 1 ms; `Pin.IN`; `Pin.PULL_DOWN` |
+  | each bit in `_fo_ui_driven` | `GPIO_OE` shows it not driven | `Pin.IN`; `Pin.PULL_DOWN` |
+  | each bit outside the mask, not in `_fo_ui_driven` | library load | `Pin.IN`; `Pin.PULL_DOWN` |
+  | each mask bit | reads high with the pull-down | `Pin.IN`; `Pin.PULL_DOWN`; listed in `ui_in_held` |
+  | each mask bit | reads low with the pull-down | `Pin.IN`; `Pin.PULL_DOWN`; latch to its `ui_in` bit; `Pin.OUT`; listed in `ui_in_driven` |
+
+  The first three rows are the release. It runs on every load, after the
+  buffer's hash check and before the FPGA is touched. The 1 ms low discharges
+  the pad (RP2350-E9). `GPIO_OE`'s address comes from `rpregs.GPIO_OE_EXPR`.
+  A pin released by the other two rows is never made an output. The last two
+  rows are the drive. It runs after the load and its clock, only when the load
+  succeeded, and only when `ui_in` is given with a mask other than 0. The
+  bits it drives become the new `_fo_ui_driven`. On the board, only ints 0 to
+  7 of that list are read, so a damaged list cannot stop later loads. A soft
+  reset of the board clears the list.
+
+  | Answer key | Lists |
+  |------------|-------|
+  | `released` | bits a previous load had driven, released before this load |
+  | `ui_in_inputs` | on a library load, the bits outside its mask that the daemon had not driven, released straight to inputs (all eight when the mask is 0 and nothing was driven); empty for a demo or upload |
+  | `ui_in_driven` | bits now driven |
+  | `ui_in_held` | mask bits left as inputs because something held them high |
+
+  A demo or upload load releases only the pins this daemon drove, so pins a
+  visitor set through the Commander are left alone; the idle display's own
+  load releases them too. A load refused for a damaged buffer leaves the
+  running design and its pins as they were; one whose release fails part way
+  leaves the running design, and its name, as they were.
 - **The display of an FPGA board nobody is using is kept moving**
   (`idle.py`). The boot check ends by streaming a design that animates the
   display from the FPGA's own oscillator, but every start of the board's SDK
