@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from fpgas_tt import idle, safe
+from fpgas_tt import idle, rpregs, safe
 from fpgas_tt.bridge import Bridge
 from fpgas_tt.repl import ReplBusy, ReplError
 from fpgas_tt.server import create_app
@@ -16,6 +18,22 @@ SET = (
     "set: clock stopped (was 10 Hz; its pin released), ui_in driven to 0 (read {read}), "
     "uio released (uio_oe_pico was {oe})"
 )
+
+
+CHIPS = ["rp2040", "rp2350"]
+
+
+@pytest.fixture(params=CHIPS)
+def chip(request) -> str:
+    return request.param
+
+
+@pytest.fixture
+async def fake_repl(fake_repl, chip):
+    """Every test here that has a board runs with it as each chip. Only this file does: the shared fixture is
+    an RP2350, and the other files do not look at the chip."""
+    fake_repl.chip = chip
+    return fake_repl
 
 
 @pytest.fixture
@@ -267,3 +285,45 @@ def test_only_a_retry_acts_on_a_factory_test_that_is_not_clocked():
     assert "and (_fo_r['clock_was'] or True)" in safe.safe_code(True)
     left = {"sdk": True, "enabled": "tt_um_factory_test", "mode": "ASIC_RP_CONTROL", "clock_was": 0}
     assert safe.outcome(left).startswith("left: the factory test is not being clocked")
+
+
+GPIO_OE_LINE = "        _fo_oe = machine.mem32[0xd0000020]\n"
+GPIO_OE_EXPR_LINE = (
+    "        _fo_oe = machine.mem32[(0xd0000030 if (machine.mem32[0x40000000] >> 12) & 0xffff == 4"
+    " else 0xd0000020)]\n"
+)
+
+
+class _Machine:
+    def __init__(self, chip_id: int) -> None:
+        self.mem32 = {0x40000000: chip_id}
+
+
+@pytest.mark.parametrize(("part", "address"), [(2, 0xD0000020), (4, 0xD0000030)])
+def test_gpio_oe_expr_by_chip(part, address):
+    machine = _Machine((part << 12) | 0x927)
+    assert eval(rpregs.GPIO_OE_EXPR, {"machine": machine}) == address  # noqa: S307 - the board-side expression
+
+
+def test_safe_code_uses_the_expression():
+    code = safe.safe_code(False)
+    assert f"machine.mem32[{rpregs.GPIO_OE_EXPR}]" in code
+    assert GPIO_OE_EXPR_LINE in code
+    assert "import sys" not in code
+    assert "mem32[0xd0000020]" not in code
+
+
+def test_safe_code_structure_unchanged():
+    before = (Path(__file__).parent / "data" / "safe_code_before_ag.txt").read_text().splitlines(keepends=True)
+    after = safe.safe_code(False).splitlines(keepends=True)
+    assert before.count(GPIO_OE_LINE) == 1
+    assert [GPIO_OE_EXPR_LINE if line == GPIO_OE_LINE else line for line in before] == after
+
+
+def test_an_rp2350_reply_whose_driven_pins_are_the_ones_made_outputs_is_set():
+    reply = {
+        "sdk": True, "enabled": idle.SDK_START_DESIGN, "mode": safe.SDK_MODE, "clock_was": 10,
+        "held": [], "driven": list(range(8)), "clock": 0, "ui_in": 0, "uio_oe": 0,
+        "ui_in_was": 1, "uio_oe_was": 0x0F,
+    }  # fmt: skip
+    assert safe.outcome(reply).startswith("set: ")
