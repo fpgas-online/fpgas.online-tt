@@ -1,6 +1,7 @@
 """What the board is comes from its USB serial and the boot check's report, never from a port."""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -160,3 +161,42 @@ def test_a_report_that_is_too_large_is_not_read(tmp_path, serial, monkeypatch):
 def test_a_report_that_cannot_be_opened_is_unknown(tmp_path, serial):
     who = identify("/dev/ttboard", tmp_path)  # a directory
     assert who.kind == "unknown" and "cannot be used" in who.reason
+
+
+# What the boot check leaves running on an FPGA demo board (fpgas.online-test-designs, boards/tt_fpga.py).
+DISPLAY = "tt-display-tt-fpga/tt_fpga_platform.bin"
+
+
+def test_what_the_boot_check_left_running_and_when_comes_from_the_boards_entry(tmp_path):
+    other = {**_tt(serial=OTHER_SERIAL), "left_running": {"design": "display", "bitstream": "something-else.bin"}}
+    path = _report(tmp_path, [other, {**_tt(), "left_running": {"design": "display", "bitstream": DISPLAY}}])
+    os.utime(path, (1_790_000_000.5, 1_790_000_000.5))
+    assert identity.left_running(SERIAL, path) == identity.LeftRunning(DISPLAY, 1_790_000_000.5)
+
+
+@pytest.mark.parametrize(
+    "board",
+    [
+        _tt(),  # the check's last load failed: `warnings`, and no `left_running`
+        {**_tt(), "left_running": None},
+        {**_tt(), "left_running": {"design": "display"}},
+        {**_tt(), "left_running": {"design": "display", "bitstream": 7}},
+        {**_tt(), "left_running": {"design": "display", "bitstream": "  "}},
+        _tt(serial=OTHER_SERIAL) | {"left_running": {"design": "display", "bitstream": DISPLAY}},  # another board
+    ],
+)
+def test_nothing_is_left_running_unless_the_boards_own_entry_says_so(tmp_path, board):
+    assert identity.left_running(SERIAL, _report(tmp_path, [board])) is None
+
+
+@pytest.mark.parametrize("text", [None, "{", "[]", '{"boards": 1}'])
+def test_nothing_is_left_running_by_a_report_that_is_missing_or_cannot_be_used(tmp_path, text):
+    path = tmp_path / "verify.json"
+    if text is not None:
+        path.write_text(text)
+    assert identity.left_running(SERIAL, path) is None
+
+
+def test_nothing_is_left_running_on_a_board_without_a_usb_serial(tmp_path):
+    board = {**_tt(), "left_running": {"design": "display", "bitstream": DISPLAY}}
+    assert identity.left_running(None, _report(tmp_path, [board])) is None
