@@ -713,3 +713,16 @@ def test_only_a_use_of_the_board_counts_as_its_use():
     assert not activity.used
     activity.touch()
     assert activity.used
+
+
+async def test_the_daemons_first_open_of_the_board_is_not_a_use_of_it(bridge, fake_repl, tmp_path, display):
+    """In the daemon the idle display is made before the bridge opens the port (server.main): the first open
+    is seen as the board coming, which starts a quiet time and is nobody's use."""
+    after_the_boot_check(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=display, after=60)
+    show._opens = 0  # as made in server.main, before on_startup opened the port
+    boot_checked(app, show)
+    assert await show.step() == "waiting"
+    quiet_for(app, 60)
+    assert await show.step() == "loaded"

@@ -8,7 +8,7 @@ board plus a health endpoint. Design spec:
 
 ## Repository Overview
 
-- `src/fpgas_tt/identity.py` — what the board is, from its USB serial and the boot check's report; `identify()`
+- `src/fpgas_tt/identity.py` — what the board is, from its USB serial and the boot check's report; `identify()`, and what the check left running on it, `left_running()`
 - `src/fpgas_tt/usbinfo.py` — USB ids and serial number of the device behind a tty (sysfs)
 - `src/fpgas_tt/bridge.py` — `Bridge` (one serial owner) and `Client`
 - `src/fpgas_tt/server.py` — aiohttp app (`/health`, `/serial`, and on FPGA boards `/designs`, `/designs/{name}/enable`, `/bitstream`, `/library`, `/library/{id}`) and CLI `main()`
