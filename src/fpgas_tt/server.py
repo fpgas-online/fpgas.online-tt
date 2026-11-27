@@ -103,6 +103,7 @@ def create_app(
     # Asked at each request, never kept: the boot check may finish after this daemon starts, and a board may
     # be swapped under it. *identify* is for the tests; the daemon reads the board's USB serial and *report*.
     app["identify"] = identify or (lambda: identity.identify(bridge.device, report))
+    app["report"] = Path(report)  # the boot check's report: also what it left running on the board (idle.py)
     app["version"] = version
     app["started"] = time.monotonic()
     app["websockets"] = set()
