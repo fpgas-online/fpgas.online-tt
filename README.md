@@ -209,7 +209,12 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
     written no more than 180 s before the daemon started. A daemon that
     `Restart=always` brought back after a visitor's session starts long after
     the report, so it says `left: the SDK is not running`, as it does in
-    every other case.
+    every other case. A clock stepped forward between the report and the
+    daemon's start gives `left` too; one stepped backward can pull a long
+    gap into the window. Any start of the daemon within the 180 s that does
+    not follow a new report (a crash, `systemctl restart fpgas-tt`,
+    `fpgas-verify --test` or `--report` elsewhere) cannot be told from the
+    boot's, so a visitor's raw-REPL soft reset in that time reads `loaded`.
   - A design a visitor loaded is never replaced, unless
     `--idle-replace-after SECONDS` is given. The daemon cannot see a visitor
     who is watching the camera or working on the Pi, so that option is for

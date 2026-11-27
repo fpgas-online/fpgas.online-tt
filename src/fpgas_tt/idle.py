@@ -84,9 +84,16 @@ TAKEN_LIMIT = 20.0
 # for the check's own end state. At boot systemd starts the daemon when the check exits (fpgas-verify.service is
 # Before= it), and the check's last step after the write is to publish its result, bounded at 60 s
 # (fpgas.online-test-designs, core.publish); a check run by hand stops this daemon and starts it after the write
-# the same way. Three times that, for the start of Python from the Pi's NFS root. Wall-clock times on both sides
-# (the report's mtime, the daemon's start): a clock stepped between them gives a gap outside the window, and
-# so the old state, never a false "loaded".
+# the same way. Three times that, for the start of Python from the Pi's NFS root.
+# Wall-clock times on both sides (the report's mtime, the daemon's start). A clock stepped forward between them
+# gives a gap outside the window, and so "left". A clock stepped backward can pull a long gap into the window:
+# unlikely, but possible.
+# What this window cannot see, and so may still say "loaded" for a board a visitor left without the SDK: any
+# start of this daemon within the window that does not follow a new report. That is a crash and Restart=always,
+# a `systemctl restart fpgas-tt`, and a `fpgas-verify --test X` or `fpgas-verify --report <elsewhere>`, which
+# stop and start this daemon without rewriting /run/fpgas-online/verify.json. Each needs a visitor's raw-REPL
+# soft reset within 180 s of the report. A marker in /run written by Activity.touch() would close this, and
+# would survive a crash; it was not done, for simplicity.
 BOOT_CHECK_WINDOW = 180.0
 
 STATE_CODE = (
@@ -341,7 +348,7 @@ class IdleDisplay:
 def _is_file(design: Path, bitstream: str) -> bool:
     """Whether the report's `bitstream` (a path inside the bitstreams package) names the file `design`."""
     rel = Path(bitstream)
-    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+    if rel.is_absolute() or not rel.parts:
         return False
     return design.parts[-len(rel.parts) :] == rel.parts
 

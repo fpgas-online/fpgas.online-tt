@@ -679,7 +679,7 @@ async def test_a_board_that_came_back_is_not_the_one_the_boot_check_left(bridge,
         {"left": False},  # the check's last load failed: `warnings`, nothing left running
         {"serial": "4df39a7a6856f86f"},  # the report is of another board
         {"bitstream": "/" + DISPLAY},  # not a path inside the bitstreams package
-        {"bitstream": "../bitstreams/" + DISPLAY},
+        {"bitstream": "../bitstreams/" + DISPLAY},  # names no file of the package: the parts do not match
         None,  # no report at all
     ],
 )
