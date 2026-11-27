@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -14,7 +16,7 @@ from fpgas_tt.repl import ReplBusy, ReplError
 from fpgas_tt.server import build_parser, create_app
 from tests.test_designs import PRE, board_tree, wait_for
 from tests.test_library import ENTRIES
-from tests.test_server import DEMOS, IS_FPGA, IS_OTHER, NOT_NAMED
+from tests.test_server import DEMOS, IS_FPGA, IS_OTHER, NOT_NAMED, SERIAL
 
 MOVING = PRE + b"a design that animates the display from the FPGA's own oscillator" * 40
 
@@ -36,7 +38,13 @@ def design(tmp_path) -> Path:
 
 
 def an_app(bridge, tmp_path, who=IS_FPGA):
-    return create_app(bridge, identify=lambda: who, demos_dir=DEMOS, uploads_dir=tmp_path / "pi-uploads")
+    return create_app(
+        bridge,
+        identify=lambda: who,
+        report=tmp_path / "verify.json",  # none, unless a test writes it (boot_checked)
+        demos_dir=DEMOS,
+        uploads_dir=tmp_path / "pi-uploads",
+    )
 
 
 def quiet_for(app, seconds: float) -> None:
@@ -528,3 +536,193 @@ async def test_idle_display_load_releases_too(bridge, fake_repl, tmp_path, desig
     assert fake_repl.tt.latch_writes[latches:] == [(0, 0)]  # discharged, then released
     assert (fake_repl.tt.ui_pin(0).hw_mode, fake_repl.tt.ui_pin(0).hw_pull) == (0, 2)  # Pin.IN, Pin.PULL_DOWN
     assert b"globals().get('_fo_ui_driven')" in bytes(fake_repl.transcript)
+
+
+# -- a board without the SDK: the boot check's own end state, or a visitor's soft reset -----------------------
+
+# What the boot check leaves running (fpgas.online-test-designs, boards/tt_fpga.py `left_running`).
+DISPLAY = "tt-display-tt-fpga/tt_fpga_platform.bin"
+
+
+@pytest.fixture
+def display(tmp_path) -> Path:
+    """The idle design where the daemon's default has it: the file the boot check leaves running."""
+    path = tmp_path / "bitstreams" / DISPLAY
+    path.parent.mkdir(parents=True)
+    path.write_bytes(MOVING)
+    return path
+
+
+def boot_checked(app, show, *, before_start=20.0, bitstream=DISPLAY, serial=SERIAL, left=True) -> None:
+    """The boot check's report, written `before_start` seconds before the daemon (`show`) started."""
+    board = {"board": "tt", "variant": "tt-fpga", "found": {"serial": serial},
+             "identity": {"usb_serial": serial, "chip": "fpga"}, "result": "pass"}  # fmt: skip
+    if left:
+        board["left_running"] = {"design": "display", "bitstream": bitstream}
+    else:
+        board["warnings"] = ["the display design could not be loaded"]
+    app["report"].write_text(json.dumps({"schema_version": 2, "result": "pass", "boards": [board]}))
+    written = show._started - before_start
+    os.utime(app["report"], (written, written))
+
+
+def after_the_boot_check(fake_repl) -> None:
+    """The board as the boot check leaves it: its raw-REPL soft reset, then its moving design; no SDK."""
+    del fake_repl._globals["tt"]
+
+
+async def test_a_board_as_the_boot_check_left_it_is_said_to_run_the_idle_design_and_is_not_touched(
+    bridge, fake_repl, tmp_path, display, caplog
+):
+    after_the_boot_check(fake_repl)
+    before = board_tree(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=display, after=60, replace_after=1800)
+    boot_checked(app, show)
+    quiet_for(app, 60)
+    with caplog.at_level(logging.INFO, logger="fpgas_tt.idle"):
+        assert await show.step() == "loaded"
+    assert "as the boot check left it" in caplog.text
+    assert fake_repl.loaded == [] and fake_repl.soft_resets == 0  # asked, and nothing else
+    assert board_tree(fake_repl) == before
+    assert show.health() == {"design": str(display), "state": "loaded"}
+    said = bytes(fake_repl.transcript)
+    quiet_for(app, 7200)  # asked once more at replace_after, and still the same
+    assert await show.step() == "loaded" and fake_repl.loaded == []
+    assert await show.step() == "loaded" and len(bytes(fake_repl.transcript)) > len(said)
+
+
+@pytest.mark.parametrize("before_start", [0.0, 20.0, idle.BOOT_CHECK_WINDOW])
+async def test_a_report_written_just_before_the_daemon_started_is_the_boot_checks(
+    bridge, fake_repl, tmp_path, display, before_start
+):
+    after_the_boot_check(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=display, after=60)
+    boot_checked(app, show, before_start=before_start)
+    quiet_for(app, 60)
+    assert await show.step() == "loaded"
+
+
+@pytest.mark.parametrize(
+    "before_start",
+    [
+        idle.BOOT_CHECK_WINDOW + 1,  # Restart=always brought the daemon back after a visitor's session
+        3600.0,  # an hour after the boot check: a visitor may have come and gone under the daemon before
+        -1.0,  # written after the daemon started: not the check that ran before it (or the clock was stepped)
+    ],
+)
+async def test_a_daemon_that_started_long_after_the_report_does_not_take_a_board_without_the_sdk_for_the_checks(
+    bridge, fake_repl, tmp_path, display, before_start
+):
+    after_the_boot_check(fake_repl)  # or a visitor's raw-REPL soft reset, before this daemon restarted
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=display, after=60)
+    boot_checked(app, show, before_start=before_start)
+    quiet_for(app, 60)
+    assert await show.step() == "left: the SDK is not running"
+    assert fake_repl.loaded == []
+
+
+@pytest.mark.parametrize("use", ["client", "run", "touch"])
+async def test_a_visitor_who_left_the_board_through_a_raw_repl_soft_reset_leaves_it_in_their_state(
+    aiohttp_client, bridge, fake_repl, tmp_path, display, use
+):
+    app = an_app(bridge, tmp_path)
+    app["idle"] = show = idle.IdleDisplay(app, design=display, after=60)
+    boot_checked(app, show)  # a fresh report: only the visit tells the two apart
+    c = await aiohttp_client(app)
+    if use == "client":
+        ws = await c.ws_connect("/serial")
+        await ws.receive_json()
+        await ws.close()
+        await wait_for(lambda: not app["websockets"])
+    elif use == "run":
+        assert (await c.post("/designs/tt_um_demo_a/enable")).status == 200
+    else:
+        app["activity"].touch()  # an upload or a library load says the same
+    after_the_boot_check(fake_repl)  # the visitor's Ctrl-A, machine.soft_reset(): the SDK's `tt` is gone
+    quiet_for(app, 60)
+    assert await show.step() == "left: the SDK is not running"
+
+
+async def test_after_the_boot_checks_state_a_visitors_soft_reset_is_still_theirs(
+    bridge, fake_repl, tmp_path, display
+):
+    after_the_boot_check(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=display, after=60)
+    boot_checked(app, show)
+    quiet_for(app, 60)
+    assert await show.step() == "loaded"
+    app["activity"].touch()  # a visitor came, soft-reset the board at the raw REPL, and left
+    quiet_for(app, 60)
+    assert await show.step() == "left: the SDK is not running"
+
+
+async def test_a_board_that_came_back_is_not_the_one_the_boot_check_left(bridge, fake_repl, tmp_path, display):
+    after_the_boot_check(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=display, after=60)
+    boot_checked(app, show)
+    bridge.opens += 1  # unplugged and plugged in again, or reset, since the daemon first opened it
+    assert await show.step() == "waiting"
+    assert not app["activity"].used  # a new quiet time, but nobody's use
+    quiet_for(app, 60)
+    assert await show.step() == "left: the SDK is not running"
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        {"bitstream": "pmod-pin-id-tt-fpga/tt_fpga_platform.bin"},  # the check left another design
+        {"left": False},  # the check's last load failed: `warnings`, nothing left running
+        {"serial": "4df39a7a6856f86f"},  # the report is of another board
+        {"bitstream": "/" + DISPLAY},  # not a path inside the bitstreams package
+        {"bitstream": "../bitstreams/" + DISPLAY},  # names no file of the package: the parts do not match
+        None,  # no report at all
+    ],
+)
+async def test_a_board_without_the_sdk_is_the_boot_checks_only_when_its_report_says_it_left_the_idle_design(
+    bridge, fake_repl, tmp_path, display, report
+):
+    after_the_boot_check(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=display, after=60)
+    if report is not None:
+        boot_checked(app, show, **report)
+    quiet_for(app, 60)
+    assert await show.step() == "left: the SDK is not running"
+
+
+async def test_an_idle_design_other_than_the_one_the_boot_check_left_is_not_said_to_run(
+    bridge, fake_repl, tmp_path, design
+):
+    after_the_boot_check(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=design, after=60)  # --idle-design: some other file
+    boot_checked(app, show)
+    quiet_for(app, 60)
+    assert await show.step() == "left: the SDK is not running"
+
+
+def test_only_a_use_of_the_board_counts_as_its_use():
+    activity = idle.Activity()
+    assert not activity.used
+    activity.restart()
+    assert not activity.used
+    activity.touch()
+    assert activity.used
+
+
+async def test_the_daemons_first_open_of_the_board_is_not_a_use_of_it(bridge, fake_repl, tmp_path, display):
+    """In the daemon the idle display is made before the bridge opens the port (server.main): the first open
+    is seen as the board coming, which starts a quiet time and is nobody's use."""
+    after_the_boot_check(fake_repl)
+    app = an_app(bridge, tmp_path)
+    show = idle.IdleDisplay(app, design=display, after=60)
+    show._opens = 0  # as made in server.main, before on_startup opened the port
+    boot_checked(app, show)
+    assert await show.step() == "waiting"
+    quiet_for(app, 60)
+    assert await show.step() == "loaded"

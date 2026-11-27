@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,7 +64,14 @@ class Identity:
 def _reported_boards(report_path: Path) -> list[dict]:
     """The Tiny Tapeout boards in the boot check's report. Raises OSError when
     the file cannot be read and ValueError when it is not a report."""
+    return _read_report(report_path)[0]
+
+
+def _read_report(report_path: Path) -> tuple[list[dict], float]:
+    """The Tiny Tapeout boards in the boot check's report, and when that report was written (its mtime, from
+    the file that was read: the check replaces it whole, by rename). Raises as `_reported_boards`."""
     with open(report_path, "rb") as f:
+        written = os.fstat(f.fileno()).st_mtime
         raw = f.read(MAX_REPORT_BYTES + 1)
     if len(raw) > MAX_REPORT_BYTES:
         raise ValueError(f"larger than {MAX_REPORT_BYTES} bytes")
@@ -73,7 +81,7 @@ def _reported_boards(report_path: Path) -> list[dict]:
         raise ValueError("nested too deeply to be a report") from exc
     if not isinstance(doc, dict) or not isinstance(doc.get("boards"), list):
         raise ValueError("not an object with a 'boards' list")
-    return [b for b in doc["boards"] if isinstance(b, dict) and b.get("board") == TT_BOARD]
+    return [b for b in doc["boards"] if isinstance(b, dict) and b.get("board") == TT_BOARD], written
 
 
 def _part(board: dict, name: str) -> dict:
@@ -137,3 +145,28 @@ def identify(device: str, report_path: Path | str = REPORT_DEFAULT) -> Identity:
         kind = FPGA if chip.lower() == FPGA_CHIP else OTHER
         return Identity(kind, serial, chip, f"{report_path} says board {serial} carries {chip}")
     return Identity(UNKNOWN, serial, None, f"{report_path} does not name board {serial}")
+
+
+@dataclass(frozen=True)
+class LeftRunning:
+    """What the boot check says it left running on a board (the report's ``left_running``), and when."""
+
+    bitstream: str  # the file the check loaded last, relative to the bitstreams package
+    written: float  # the report's mtime (seconds since the epoch)
+
+
+def left_running(usb_serial: str | None, report_path: Path | str = REPORT_DEFAULT) -> LeftRunning | None:
+    """What the boot check left running on the board with *usb_serial*, or None: no such board in a report that
+    can be read, or the check did not say it left anything (its last load failed: ``warnings`` instead).
+    Why a report cannot be read is said by `identify`, which is asked first."""
+    if usb_serial is None:
+        return None
+    try:
+        boards, written = _read_report(Path(report_path))
+    except (OSError, ValueError):
+        return None
+    for board in boards:
+        if _serial_of(board) == usb_serial:
+            bitstream = _text(_part(board, "left_running").get("bitstream"))
+            return LeftRunning(bitstream, written) if bitstream else None
+    return None

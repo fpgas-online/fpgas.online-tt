@@ -22,7 +22,15 @@ The rules:
 * Only on a board the boot check's report says carries the FPGA breakout. A board with a Tiny Tapeout chip is
   left alone (its SDK's default configuration applies ``ui_in = 1`` to the factory test itself).
 * A board without the SDK's ``tt`` object is left alone: that is the state the boot check leaves, with its
-  moving design already in the FPGA, and starting the SDK would replace it with the factory test.
+  moving design already in the FPGA, and starting the SDK would replace it with the factory test. It is also
+  what a visitor leaves who soft-reset the board at the raw REPL. The two are told apart, and the first is
+  said to be ``loaded`` (the idle design is what runs), only while all of these hold
+  (`IdleDisplay._boot_checks_design_runs`): nobody has used the board through this daemon (no client, Run,
+  upload or library load: `Activity.used`), the board is the one first opened (`Bridge.opens` is 1), the
+  boot check's report says it left this file running on this board, and the report was written just before
+  this daemon started (`BOOT_CHECK_WINDOW`). The last is what keeps a daemon that ``Restart=always`` brought
+  back after a visitor's session from taking the visitor's state for the boot check's: its start is long after
+  the report. Anything else is ``left: the SDK is not running``, as before.
 * After ``after`` quiet seconds a board in the SDK's start state (the factory test, or nothing) gets the idle
   design. A design a visitor loaded is replaced only after ``replace_after`` quiet seconds, and that is off
   unless asked for: the daemon cannot see a visitor who is watching the camera or working on the Pi, and
@@ -72,6 +80,21 @@ FAILED_WAIT = 600.0
 ASK_TIMEOUT = 5.0
 LOAD_TIMEOUT = 12.0
 TAKEN_LIMIT = 20.0
+# How long after the boot check wrote its report this daemon may start and still take a board without the SDK
+# for the check's own end state. At boot systemd starts the daemon when the check exits (fpgas-verify.service is
+# Before= it), and the check's last step after the write is to publish its result, bounded at 60 s
+# (fpgas.online-test-designs, core.publish); a check run by hand stops this daemon and starts it after the write
+# the same way. Three times that, for the start of Python from the Pi's NFS root.
+# Wall-clock times on both sides (the report's mtime, the daemon's start). A clock stepped forward between them
+# gives a gap outside the window, and so "left". A clock stepped backward can pull a long gap into the window:
+# unlikely, but possible.
+# What this window cannot see, and so may still say "loaded" for a board a visitor left without the SDK: any
+# start of this daemon within the window that does not follow a new report. That is a crash and Restart=always,
+# a `systemctl restart fpgas-tt`, and a `fpgas-verify --test X` or `fpgas-verify --report <elsewhere>`, which
+# stop and start this daemon without rewriting /run/fpgas-online/verify.json. Each needs a visitor's raw-REPL
+# soft reset within 180 s of the report. A marker in /run written by Activity.touch() would close this, and
+# would survive a crash; it was not done, for simplicity.
+BOOT_CHECK_WINDOW = 180.0
 
 STATE_CODE = (
     "import json\n"
@@ -82,12 +105,19 @@ STATE_CODE = (
 
 
 class Activity:
-    """When somebody last used the board through this daemon."""
+    """When somebody last used the board through this daemon, and whether anybody has since it started."""
 
     def __init__(self) -> None:
         self.last = time.monotonic()
+        self.used = False
 
     def touch(self) -> None:
+        """Somebody used the board: a client, a Run, an upload."""
+        self.last = time.monotonic()
+        self.used = True
+
+    def restart(self) -> None:
+        """A new quiet time that is not somebody's use (the board came back)."""
         self.last = time.monotonic()
 
 
@@ -156,6 +186,7 @@ class IdleDisplay:
         self.state = "waiting"
         self._asked: tuple[float, int] | None = None  # the quiet time, and its stage, the board was asked in
         self._opens = app["bridge"].opens  # the board, as last seen: it comes back as another one
+        self._started = time.time()  # wall clock, as the boot check report's mtime (BOOT_CHECK_WINDOW)
         self._file_warned = False
         self._task: asyncio.Task | None = None
 
@@ -190,7 +221,7 @@ class IdleDisplay:
         if bridge.opens != self._opens:  # unplugged, reset or power-cycled: whatever it had loaded is gone
             self._opens = bridge.opens
             self._asked = None
-            app["activity"].touch()
+            app["activity"].restart()  # Bridge.opens says the board came back; nobody is known to have used it
         if not bridge.present:
             self.state = "board not present"
             return None
@@ -258,6 +289,9 @@ class IdleDisplay:
             if not wanted(state, time.monotonic() - stamp, self.after, self.replace_after):
                 if enabled == designs.IDLE_NAME:
                     self.state = "loaded"
+                elif not state["sdk"] and self._boot_checks_design_runs():
+                    self.state = "loaded"
+                    log.info("idle display: the unused board still runs %s, as the boot check left it", self.design)
                 else:
                     self.state = f"left: {enabled if state['sdk'] else 'the SDK is not running'}"
                 return self.state
@@ -275,6 +309,17 @@ class IdleDisplay:
             self.state = "loaded"
             log.info("idle display: streamed %s into the unused board (was: %s)", self.design, enabled)
         return self.state
+
+    def _boot_checks_design_runs(self) -> bool:
+        """Whether a board without the SDK is as the boot check left it, running the idle design: see the rules
+        in the module's docstring. Nothing is awaited, and the report is on /run (tmpfs)."""
+        app = self._app
+        if app["activity"].used or app["bridge"].opens != 1:
+            return False
+        left = identity.left_running(app["identify"]().usb_serial, app["report"])
+        if left is None or not 0 <= self._started - left.written <= BOOT_CHECK_WINDOW:
+            return False
+        return _is_file(self.design, left.bitstream)
 
     async def _run(self) -> None:
         while True:
@@ -298,6 +343,14 @@ class IdleDisplay:
                 await self._task
             self._task = None
         self._app["taken"].release()
+
+
+def _is_file(design: Path, bitstream: str) -> bool:
+    """Whether the report's `bitstream` (a path inside the bitstreams package) names the file `design`."""
+    rel = Path(bitstream)
+    if rel.is_absolute() or not rel.parts:
+        return False
+    return design.parts[-len(rel.parts) :] == rel.parts
 
 
 def _printable(text: str) -> str:

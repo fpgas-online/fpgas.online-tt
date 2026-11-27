@@ -199,7 +199,22 @@ Part of the [fpgas.online](https://fpgas.online) platform. Design:
   - A board that was unplugged, reset or power-cycled starts a new quiet
     time; so does a load that failed (ten minutes).
   - A board without the SDK's `tt` object is left alone: that is how the boot
-    check leaves it, with the moving design already running.
+    check leaves it, with the moving design already running. A visitor who
+    soft-resets the board at the raw REPL leaves it the same way. The daemon
+    says `loaded` for the boot check's state only while nobody has used the
+    board through it (no client, Run, upload or library load), the board is
+    the one it first opened, the boot check's report
+    (`/run/fpgas-online/verify.json`) says it left the idle design's file
+    running on this board (`left_running.bitstream`), and that report was
+    written no more than 180 s before the daemon started. A daemon that
+    `Restart=always` brought back after a visitor's session starts long after
+    the report, so it says `left: the SDK is not running`, as it does in
+    every other case. A clock stepped forward between the report and the
+    daemon's start gives `left` too; one stepped backward can pull a long
+    gap into the window. Any start of the daemon within the 180 s that does
+    not follow a new report (a crash, `systemctl restart fpgas-tt`,
+    `fpgas-verify --test` or `--report` elsewhere) cannot be told from the
+    boot's, so a visitor's raw-REPL soft reset in that time reads `loaded`.
   - A design a visitor loaded is never replaced, unless
     `--idle-replace-after SECONDS` is given. The daemon cannot see a visitor
     who is watching the camera or working on the Pi, so that option is for
